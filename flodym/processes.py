@@ -124,12 +124,9 @@ class Process(PydanticBaseModel):
     def try_compute(self):
         if self._stock is None:
             self.compute_no_stock()
-        elif isinstance(self._stock, StockDrivenDSM):
-            self.compute_stock_driven()
-        elif isinstance(self._stock, InflowDrivenDSM):
-            self.compute_inflow_driven()
-        elif isinstance(self._stock, SimpleFlowDrivenStock):
-            self.compute_simple_flow_driven()
+        else:
+            self._stock.compute_process()
+
         if self.unknown_flows("in") or self.unknown_flows("out"):
             raise ValueError(
                 f"In Process {self.name}: After computation, there are still unknown flows. "
@@ -140,57 +137,6 @@ class Process(PydanticBaseModel):
         self.compute_total()
         self.apply_dimension_splitter()
         self.compute_flows()
-
-    def compute_stock_driven(self):
-
-        self._stock.compute()
-
-        self._total = self._stock.outflow
-        self.apply_dimension_splitter(sides=["out"])
-        self.compute_flows(sides=["out"])
-
-        self._total = self._stock.inflow
-        self.apply_dimension_splitter(sides=["in"])
-        self.compute_flows(sides=["in"])
-
-    def compute_inflow_driven(self):
-        if self._stock.inflow.is_set:
-            self._stock.compute()
-            self._total = self._stock.inflow
-            self.compute_flows(sides=["in"])
-        else:
-            self.compute_total(try_sides=["in"])
-            self._stock.inflow[...] = self._total
-            self._stock.compute()
-
-        self._total = self._stock.outflow
-        self.apply_dimension_splitter(sides=["out"])
-        self.compute_flows(sides=["out"])
-
-    def compute_simple_flow_driven(self):
-        if self.inflows:
-            self.compute_total(try_sides=["in"])
-            if self._stock.inflow.dims - self._total.dims:
-                names = ", ".join((self._stock.inflow.dims - self._total.dims).names)
-                raise ValueError(
-                    f"In Process {self.name}: Stock inflow has dimensions {names} not contained in the "
-                    "dimensions of the summed inflow Flows. Consider using less dimensions for the "
-                    "stock or a preceding process with a dimension_splitter."
-                )
-            self._stock.inflow[...] = self._total
-
-        if self.outflows:
-            self.compute_total(try_sides=["out"])
-            if self._stock.outflow.dims - self._total.dims:
-                names = ", ".join((self._stock.outflow.dims - self._total.dims).names)
-                raise ValueError(
-                    f"In Process {self.name}: Stock outflow has dimensions {names} not contained in the "
-                    "dimensions of the summed outflow Flows. Consider using less dimensions for the "
-                    "stock or a neighboring process with a dimension_splitter."
-                )
-            self._stock.outflow[...] = self._total
-
-        self._stock.compute()
 
     def handle_underdetermined(self, error: UnderdeterminedError, underdetermined_behavior: str = "error") -> bool:
         if underdetermined_behavior == "error":
