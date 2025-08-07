@@ -50,8 +50,8 @@ class Process(PydanticBaseModel):
     """Inflows to the process, keyed by linked process name."""
     _outflows: Dict[str, Flow] = {}
     """Outflows from the process, keyed by linked process name."""
-    _stock: Stock = None
     dimension_splitter: "FlodymArray" = None
+    stock: Stock = None
     _inflow_shares: Dict[str, "FlodymArray"] = {}
     _outflow_shares: Dict[str, "FlodymArray"] = {}
     _total: FlodymArray = None
@@ -83,30 +83,54 @@ class Process(PydanticBaseModel):
         """Add an outflow flow from the process."""
         self._outflows[flow.to_process.name] = flow
 
-    def set_stock(self, stock: Stock) -> None:
-        """Set the stock associated with this process."""
-        self._stock = stock
+    def remove_inflow(self, from_process: str) -> None:
+        """Remove an inflow from the process."""
+        if from_process in self._inflows:
+            del self._inflows[from_process]
+        else:
+            raise ValueError(f"No inflow from process '{from_process}' found.")
 
-    def set_inflow_share(self, from_process: str, share: FlodymArray):
+    def remove_outflow(self, to_process: str) -> None:
+        """Remove an outflow from the process."""
+        if to_process in self._outflows:
+            del self._outflows[to_process]
+        else:
+            raise ValueError(f"No outflow to process '{to_process}' found.")
+
+    def add_inflow_share(self, from_process: str, share: FlodymArray):
         if from_process not in self._inflows:
             raise ValueError(f"No inflow from process '{from_process}' found.")
         self._inflow_shares[from_process] = share
 
-    def set_outflow_share(self, to_process: str, share: FlodymArray):
+    def add_outflow_share(self, to_process: str, share: FlodymArray):
         if to_process not in self._outflows:
             raise ValueError(f"No outflow to process '{to_process}' found.")
         self._outflow_shares[to_process] = share
+
+    def remove_inflow_share(self, from_process: str):
+        """Remove the inflow share for a given process."""
+        if from_process in self._inflow_shares:
+            del self._inflow_shares[from_process]
+        else:
+            raise ValueError(f"No inflow share for process '{from_process}' found.")
+
+    def remove_outflow_share(self, to_process: str):
+        """Remove the outflow share for a given process."""
+        if to_process in self._outflow_shares:
+            del self._outflow_shares[to_process]
+        else:
+            raise ValueError(f"No outflow share for process '{to_process}' found.")
 
     @property
     def is_computed(self) -> bool:
         """Check if the process has been computed."""
         if self.unknown_flows("in") or self.unknown_flows("out"):
             return False
-        if self._stock is not None and not self._stock.is_computed:
+        if self.stock is not None and not self.stock.is_computed:
             return False
         return True
 
-    def compute(self, on_underdetermined: str = "error", recursive: bool=False) -> None:
+    def compute(self, on_underdetermined: ErrorBehavior = "error", recursive: bool=False) -> None:
         if self.is_computed:
             logging.debug(f"Process {self.name} with ID {self.id} is already computed.")
             return
@@ -114,27 +138,34 @@ class Process(PydanticBaseModel):
             logging.debug(f"Process {self.name} with ID {self.id} is the system boundary and cannot be computed.")
             return
         try:
+
+            was_overdetermined = self.is_overdetermined
             self.try_compute()
-            if config.check_mass_balance_processes:
+
+            if config.checks.process_shares:
+                self.check_shares(was_overdetermined=was_overdetermined)
+            if config.checks.mass_balance_processes:
                 self.check_mass_balance()
+
             if recursive:
                 for flow in self.inflows.values():
                     flow.from_process.compute(on_underdetermined=on_underdetermined, recursive=True)
                 for flow in self.outflows.values():
                     flow.to_process.compute(on_underdetermined=on_underdetermined, recursive=True)
+
         except UnderdeterminedError as e:
             if on_underdetermined is None:
-                on_underdetermined = config.error_behavior_process_underdetermined
+                on_underdetermined = config.error_behaviors.process_underdetermined
             if on_underdetermined == ErrorBehavior.INFO:
                 # shorter message for readability in recursive mode (many will be underdertermined)
                 e.message = f"Process {self.name} is underdetermined. Skip computation."
             handle_error(behavior=on_underdetermined, error=e)
 
     def try_compute(self):
-        if self._stock is None:
+        if self.stock is None:
             self.compute_no_stock()
         else:
-            self._stock.compute_process()
+            self.stock.compute_process()
 
         if self.unknown_flows("in") or self.unknown_flows("out"):
             raise ValueError(
@@ -184,6 +215,13 @@ class Process(PydanticBaseModel):
             name for name, flow in self.flows(side).items() if flow.is_set
             and name in self.shares(side)
         ]
+
+    @property
+    def is_overdetermined(self) -> bool:
+        n_degree_of_freedom = len(self.flows("in")) + len(self.flows("out")) + 1  # +1 for total
+        n_conditions = 2  # sum_inflows = total and sum_outflows = total
+        n_given = (len(self.known_flows("in")) + len(self.known_flows("out")) + len(self.shares("in")) + len(self.shares("out")))
+        return n_given > n_degree_of_freedom - n_conditions
 
     def can_compute_total(self, from_side: str) -> bool:
         """Check if the process can compute the total flow through the process in the given direction."""
@@ -239,6 +277,7 @@ class Process(PydanticBaseModel):
     def apply_dimension_splitter(self, sides: list[str] = ["in", "out"]):
         """Apply the dimension splitter to the total flow."""
 
+        # set union of all unknown flows
         dims_unknown = DimensionSet(dim_list=[])
         for side in sides:
             for flow in self.unknown_flows(side).values():
@@ -246,6 +285,8 @@ class Process(PydanticBaseModel):
         missing_dims = dims_unknown - self._total.dims
 
         if not missing_dims:
+            if self.dimension_splitter is not None:
+                self.handle_unused_splitter()
             return
 
         if self.dimension_splitter is None:
@@ -261,13 +302,19 @@ class Process(PydanticBaseModel):
 
         common_dims = splitter_dims & self._total.dims
         splitter_sum = self.dimension_splitter.sum_to(common_dims.letters)
-        tolerance = 10 * self._absolute_float_precision
-        if np.max(np.abs((splitter_sum.values - 1))) > tolerance:
+        if np.max(np.abs((splitter_sum.values - 1))) > self.tolerance:
             raise ValueError(
                 f"Dimension splitter of process {self.name} does not sum to 1 if summed to common dimensions with process total {common_dims.names}."
             )
 
         self._total *= self.dimension_splitter
+
+    def handle_unused_splitter(self):
+        message = f"In Process {self.name}: Dimension splitter is set, but not used. Given split may not be fulfilled."
+        handle_error(
+            behavior=config.error_behaviors.unused_dimension_splitter,
+            message=message
+        )
 
     def compute_flows(self, sides: List[str] = ["in", "out"]):
         """Compute the flows based on the total flow."""
@@ -311,6 +358,28 @@ class Process(PydanticBaseModel):
             for flow_name, flow in temp_flows.items():
                 self.flows(side)[flow_name][...] = flow
 
+    def check_shares(self, was_overdetermined: bool):
+        for side in ["in", "out"]:
+            for name, share in self.shares(side).items():
+                error = self._total * share - self.flows(side)[name]
+                max_error = np.max(np.abs(error.values))
+                if max_error > self.tolerance:
+                    message = (
+                        f"after computation of process {self.name}: Share of flow to/from process "
+                        f"{name} is not fulfilled (error = {max_error})."
+                    )
+                    if was_overdetermined:
+                        message += (
+                            "This may be due to the process being overdetermined."
+                            "If it is not intentional, consider removing some shares or given flows."
+                        )
+                    else:
+                        message += "This may be due to lacking float precision, or an internal flodym error."
+                    handle_error(
+                        behavior=config.error_behaviors.process_shares,
+                        message=message
+                    )
+
     @property
     def net_inflow(self):
         return sum(self.inflows.values()) - sum(self.outflows.values())
@@ -328,14 +397,18 @@ class Process(PydanticBaseModel):
             max_outflow = 0.
         return max(max_inflow, max_outflow)
 
-    def check_mass_balance(self, tolerance: float=None, error_behavior: ErrorBehavior = None, mass_change_target: FlodymArray = None):
+    @property
+    def tolerance(self) -> float:
+        """The tolerance for checks like mass balance"""
+        if config.tolerance is not None:
+            return config.tolerance
+        return 10 * self._absolute_float_precision
+
+    def check_mass_balance(self, error_behavior: ErrorBehavior = None, mass_change_target: FlodymArray = None):
         """Compute mass balance, and check whether it is within a certain tolerance.
         Throw an error if it isn't.
 
         Args:
-            tolerance (float, optional): The tolerance for the mass balance check.
-                If None, takes the global config setting, which defaults to 100 times the numpy
-                float precision, multiplied by the maximum absolute flow value.
             error_behavior (ErrorBehavior): What to do if the mass balance check fails.
                 If None, takes the global config setting, which defaults to raising an error
         """
@@ -346,20 +419,15 @@ class Process(PydanticBaseModel):
 
         logging.info(f"Checking mass balance of {self.__class__.__name__} object...")
 
-        if tolerance is None:
-            tolerance = config.tolerance
-        if tolerance is None:
-            tolerance = 10 * self._absolute_float_precision
-
         if mass_change_target is None:
-            mass_change_target = 0. if self._stock is None else self._stock.net_inflow
+            mass_change_target = 0. if self.stock is None else self.stock.net_inflow
         # net_inflow = mass_change, so the difference should be zero
         mass_balance = self.net_inflow - mass_change_target
         max_error =  np.max(np.abs(mass_balance.values))
-        if max_error > tolerance:
+        if max_error > self.tolerance:
             message = f"In process {self.name}: Mass balance check failed (error = {max_error})"
             if error_behavior is None:
-                error_behavior = config.error_behavior_mass_balance
+                error_behavior = config.error_behaviors.mass_balance
             handle_error(behavior=error_behavior, message=message)
         else:
             logging.info(f"In process {self.name}: Success - Mass balance is consistent!")
@@ -394,13 +462,13 @@ def set_process_parameters(processes: Dict[str, Process], definitions: List[Proc
             for from_process, parameter_name in definition.inflow_shares.items():
                 if parameter_name not in parameters:
                     raise ValueError(f"Parameter {parameter_name} given in definition of process {definition.name} is not defined.")
-                process.set_inflow_share(from_process, parameters[parameter_name])
+                process.add_inflow_share(from_process, parameters[parameter_name])
 
         if definition.outflow_shares:
             for to_process, parameter_name in definition.outflow_shares.items():
                 if parameter_name not in parameters:
                     raise ValueError(f"Parameter {parameter_name} given in definition of process {definition.name} is not defined.")
-                process.set_outflow_share(to_process, parameters[parameter_name])
+                process.add_outflow_share(to_process, parameters[parameter_name])
 
         if definition.dimension_splitter:
             if definition.dimension_splitter not in parameters:

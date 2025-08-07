@@ -234,7 +234,7 @@ class MFASystem(PydanticBaseModel):
         """
         logging.info("Checking flows for NaN and negative values...")
         if error_behavior is None:
-            error_behavior = config.error_behavior_check_flows
+            error_behavior = config.error_behaviors.check_flows
 
         flows = [f for f in self.flows.values() if f.name not in exceptions]
         flows = [

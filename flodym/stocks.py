@@ -25,7 +25,7 @@ def stock_compute_decorator(func):
         self._check_needed_arrays()
         func(self, *args, **kwargs)
         self.mark_computed()
-        if config.check_mass_balance_stocks:
+        if config.checks.mass_balance_stocks:
             self.check_mass_balance()
     wrapper.is_decorated = True
 
@@ -92,7 +92,7 @@ class Stock(PydanticBaseModel):
     @model_validator(mode="after")
     def add_to_process(self):
         if self.process is not None:
-            self.process.set_stock(self)
+            self.process.stock = self
         return self
 
     @model_validator(mode="after")
@@ -172,7 +172,7 @@ class Stock(PydanticBaseModel):
                 self.stock._absolute_float_precision,
             )
         if error_behavior is None:
-            error_behavior = config.error_behavior_mass_balance
+            error_behavior = config.error_behaviors.mass_balance
 
         if max_error > tolerance:
             message = f"In stock {self.name}: Mass balance check failed (error = {max_error})"
