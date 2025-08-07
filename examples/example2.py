@@ -56,6 +56,7 @@ from flodym import (
     ProcessDefinition,
     MFASystem,
     SimpleFlowDrivenStock,
+    config,
 )
 from flodym.export import PlotlyArrayPlotter
 

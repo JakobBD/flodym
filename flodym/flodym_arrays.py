@@ -593,6 +593,16 @@ class FlodymArray(PydanticBaseModel):
         """Mark the flow as not having values"""
         self._is_set = False
 
+    @property
+    def _absolute_float_precision(self) -> float:
+        """The numpy float precision, multiplied by the maximum absolute flow or stock value."""
+        max_value = np.max(np.abs(self.values))
+        epsilon = np.finfo(self.values.dtype).eps
+        return epsilon * max_value
+
+    def _tolerance(self, relative=10.) -> float:
+        return relative * self._absolute_float_precision
+
 
 class SubArrayHandler:
     """This class handles subsets of the 'values' numpy array of a FlodymArray object, created by slicing along one or

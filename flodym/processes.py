@@ -5,9 +5,10 @@ from functools import reduce
 import numpy as np
 
 from .flodym_arrays import Flow, FlodymArray, Parameter
-from .stocks import Stock, StockDrivenDSM, InflowDrivenDSM, SimpleFlowDrivenStock
+from .stocks import Stock
 from .mfa_definition import ProcessDefinition
 from .dimensions import DimensionSet
+from .config import config, handle_error, ErrorBehavior
 
 
 class UnderdeterminedError(Exception):
@@ -20,14 +21,14 @@ class UnderdeterminedError(Exception):
             for side in sides:
                 message += f"Tried to compute from {side}flows, but failed. Reasons:\n"
                 if not process.known_flows(side):
-                    message += f"- no flow from this side has an absolute value given"
+                    message += f"- no flow from this side has an absolute value given\n"
                 for linked_process in process.neither_known(side):
                     message += f"- for flow from/to process {linked_process}, neither share nor absolute value is given.\n"
         elif stage == "flows":
             for side in sides:
                 message += f"Failed to compute {side}flows from total; For more than one {side}flow, neither share nor absolute value was given.\n"
                 message += f"Please provide either share or absolute value for all but one of the flows from/to the processes "
-                message += ", ".join(process.neither_known(side)) + "."
+                message += ", ".join(process.neither_known(side)) + ".\n"
         super().__init__(message)
         self.message = message
 
@@ -96,16 +97,17 @@ class Process(PydanticBaseModel):
             raise ValueError(f"No outflow to process '{to_process}' found.")
         self._outflow_shares[to_process] = share
 
+    @property
     def is_computed(self) -> bool:
         """Check if the process has been computed."""
         if self.unknown_flows("in") or self.unknown_flows("out"):
             return False
-        if self._stock is not None and not self._stock.is_computed():
+        if self._stock is not None and not self._stock.is_computed:
             return False
         return True
 
-    def compute(self, underdetermined_behavior: str = "error", recursive: bool=False) -> None:
-        if self.is_computed():
+    def compute(self, on_underdetermined: str = "error", recursive: bool=False) -> None:
+        if self.is_computed:
             logging.debug(f"Process {self.name} with ID {self.id} is already computed.")
             return
         if self.id == 0:
@@ -113,13 +115,20 @@ class Process(PydanticBaseModel):
             return
         try:
             self.try_compute()
+            if config.check_mass_balance_processes:
+                self.check_mass_balance()
             if recursive:
                 for flow in self.inflows.values():
-                    flow.from_process.compute(underdetermined_behavior=underdetermined_behavior, recursive=True)
+                    flow.from_process.compute(on_underdetermined=on_underdetermined, recursive=True)
                 for flow in self.outflows.values():
-                    flow.to_process.compute(underdetermined_behavior=underdetermined_behavior, recursive=True)
+                    flow.to_process.compute(on_underdetermined=on_underdetermined, recursive=True)
         except UnderdeterminedError as e:
-            self.handle_underdetermined(error=e, underdetermined_behavior=underdetermined_behavior)
+            if on_underdetermined is None:
+                on_underdetermined = config.error_behavior_process_underdetermined
+            if on_underdetermined == ErrorBehavior.INFO:
+                # shorter message for readability in recursive mode (many will be underdertermined)
+                e.message = f"Process {self.name} is underdetermined. Skip computation."
+            handle_error(behavior=on_underdetermined, error=e)
 
     def try_compute(self):
         if self._stock is None:
@@ -137,18 +146,6 @@ class Process(PydanticBaseModel):
         self.compute_total()
         self.apply_dimension_splitter()
         self.compute_flows()
-
-    def handle_underdetermined(self, error: UnderdeterminedError, underdetermined_behavior: str = "error") -> bool:
-        if underdetermined_behavior == "error":
-            raise error
-        elif underdetermined_behavior == "warn":
-            logging.warning(error.message)
-        elif underdetermined_behavior == "info":
-            logging.info(f"Process {self.name} is underdetermined. Skip computation.")
-        elif underdetermined_behavior == "ignore":
-            return
-        else:
-            raise ValueError(f"Unknown behavior: {underdetermined_behavior}")
 
     def flows(self, direction: str):
         if direction == "in":
@@ -187,14 +184,6 @@ class Process(PydanticBaseModel):
             name for name, flow in self.flows(side).items() if flow.is_set
             and name in self.shares(side)
         ]
-
-    # def sides(self, direction: str) -> List[str]:
-    #     if direction == "forward":
-    #         return ["in", "out"]
-    #     elif direction == "backward":
-    #         return ["out", "in"]
-    #     else:
-    #         raise ValueError("Direction must be 'forward' or 'backward'.")
 
     def can_compute_total(self, from_side: str) -> bool:
         """Check if the process can compute the total flow through the process in the given direction."""
@@ -259,26 +248,26 @@ class Process(PydanticBaseModel):
         if not missing_dims:
             return
 
-        if self._dimension_splitter is None:
+        if self.dimension_splitter is None:
             raise ValueError(
                 f"Process {self.name} has missing dimensions {missing_dims.names} for unknown flows, but no dimension splitter is set."
             )
 
-        splitter_dims = self._dimension_splitter.dims
+        splitter_dims = self.dimension_splitter.dims
         if missing_dims - splitter_dims:
             raise ValueError(
                 f"Dimension splitter of process {self.name} does not cover all dimensions {missing_dims.names} needed to determine unknown flows from total flow."
             )
 
         common_dims = splitter_dims & self._total.dims
-        splitter_sum = self._dimension_splitter.sum_to(common_dims.letters)
-        tolerance = 1e-6 # TODO
+        splitter_sum = self.dimension_splitter.sum_to(common_dims.letters)
+        tolerance = 10 * self._absolute_float_precision
         if np.max(np.abs((splitter_sum.values - 1))) > tolerance:
             raise ValueError(
                 f"Dimension splitter of process {self.name} does not sum to 1 if summed to common dimensions with process total {common_dims.names}."
             )
 
-        self._total *= self._dimension_splitter
+        self._total *= self.dimension_splitter
 
     def compute_flows(self, sides: List[str] = ["in", "out"]):
         """Compute the flows based on the total flow."""
@@ -322,6 +311,60 @@ class Process(PydanticBaseModel):
             for flow_name, flow in temp_flows.items():
                 self.flows(side)[flow_name][...] = flow
 
+    @property
+    def net_inflow(self):
+        return sum(self.inflows.values()) - sum(self.outflows.values())
+
+    @property
+    def _absolute_float_precision(self) -> float:
+        """The numpy float precision, multiplied by the maximum absolute flow or stock value."""
+        if self.inflows:
+            max_inflow = max([f._absolute_float_precision for f in self.inflows.values()])
+        else:
+            max_inflow = 0.
+        if self.outflows:
+            max_outflow = max([f._absolute_float_precision for f in self.outflows.values()])
+        else:
+            max_outflow = 0.
+        return max(max_inflow, max_outflow)
+
+    def check_mass_balance(self, tolerance: float=None, error_behavior: ErrorBehavior = None, mass_change_target: FlodymArray = None):
+        """Compute mass balance, and check whether it is within a certain tolerance.
+        Throw an error if it isn't.
+
+        Args:
+            tolerance (float, optional): The tolerance for the mass balance check.
+                If None, takes the global config setting, which defaults to 100 times the numpy
+                float precision, multiplied by the maximum absolute flow value.
+            error_behavior (ErrorBehavior): What to do if the mass balance check fails.
+                If None, takes the global config setting, which defaults to raising an error
+        """
+
+        if self.id == 0 and mass_change_target is None:
+            logging.info(f"mass_change_target not given. Skip mass balance check for system environment.")
+            return
+
+        logging.info(f"Checking mass balance of {self.__class__.__name__} object...")
+
+        if tolerance is None:
+            tolerance = config.tolerance
+        if tolerance is None:
+            tolerance = 10 * self._absolute_float_precision
+
+        if mass_change_target is None:
+            mass_change_target = 0. if self._stock is None else self._stock.net_inflow
+        # net_inflow = mass_change, so the difference should be zero
+        mass_balance = self.net_inflow - mass_change_target
+        max_error =  np.max(np.abs(mass_balance.values))
+        if max_error > tolerance:
+            message = f"In process {self.name}: Mass balance check failed (error = {max_error})"
+            if error_behavior is None:
+                error_behavior = config.error_behavior_mass_balance
+            handle_error(behavior=error_behavior, message=message)
+        else:
+            logging.info(f"In process {self.name}: Success - Mass balance is consistent!")
+
+
 def make_processes(definitions: List[str|ProcessDefinition]) -> dict[str, Process]:
     """Create a dictionary of processes from a list of process names."""
     processes = {}
@@ -363,16 +406,3 @@ def set_process_parameters(processes: Dict[str, Process], definitions: List[Proc
             if definition.dimension_splitter not in parameters:
                 raise ValueError(f"Dimension splitter {definition.dimension_splitter} given in definition of process {definition.name} is not defined.")
             process.dimension_splitter = parameters[definition.dimension_splitter]
-
-# conditions for well-determinedness: [no underdeterminedness]
-# - (n_i + n_o) - 1 knowns: [or more]
-#   - n_i + n_o + 1 unknowns (a_i, a_o, total)
-#   - two conditions: sum a_i = 1, sum a_o = 1
-# - total number of i/o with neither share nor value must be one [not exceed one]
-# - at least one absolute value
-
-# dimensions:
-# - before total: all prm dims must be contained in the flow
-# - total: dimension splitter may be applied
-#   - consistency check: when summed to dim intersection with total, must be one
-# - after total: all prm dims must be contained in the total
