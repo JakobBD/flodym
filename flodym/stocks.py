@@ -4,7 +4,6 @@ including flow-driven stocks and dynamic (lifetime-based) stocks.
 
 from abc import abstractmethod
 import numpy as np
-from scipy.linalg import solve_triangular
 from pydantic import BaseModel as PydanticBaseModel, ConfigDict, model_validator
 from typing import Optional, Union, TYPE_CHECKING
 import logging
@@ -151,6 +150,15 @@ class Stock(PydanticBaseModel):
         """
         return desired_stock_type(**self.__dict__, **kwargs)
 
+    def tolerance(self) -> float:
+        if config.absolute_tolerance is not None:
+            return config.absolute_tolerance
+        return config.relative_tolerance * max(
+                self.inflow._absolute_float_precision,
+                self.outflow._absolute_float_precision,
+                self.stock._absolute_float_precision,
+            )
+
     def check_mass_balance(self, tolerance: float = None, error_behavior: ErrorBehavior = None):
         """Compute mass balance, and check whether it is within a certain tolerance.
         Throw an error if it isn't.
@@ -164,16 +172,11 @@ class Stock(PydanticBaseModel):
         """
         max_error = np.max(np.abs(self.balance.values))
         if tolerance is None:
-            tolerance = config.tolerance
-        if tolerance is None:
-            tolerance = max(
-                self.inflow._absolute_float_precision,
-                self.outflow._absolute_float_precision,
-                self.stock._absolute_float_precision,
-            )
+            tolerance = config.absolute_tolerance
         if error_behavior is None:
             error_behavior = config.error_behaviors.mass_balance
-
+        if tolerance is None:
+            tolerance = self.tolerance()
         if max_error > tolerance:
             message = f"In stock {self.name}: Mass balance check failed (error = {max_error})"
             handle_error(
@@ -245,6 +248,7 @@ class SimpleFlowDrivenStock(Stock):
                 )
             self.outflow[...] = self.process._total
 
+        self.process.check_shares()
         self.compute()
 
 
@@ -339,6 +343,7 @@ class InflowDrivenDSM(DynamicStockModel):
             self.compute()
             self.process._total = self.inflow
             self.process.compute_flows(sides=["in"])
+            self.process.check_shares(sides=["in"])
         else:
             self.process.compute_total(try_sides=["in"])
             self.inflow[...] = self.process._total
@@ -347,6 +352,7 @@ class InflowDrivenDSM(DynamicStockModel):
         self.process._total = self.outflow
         self.process.apply_dimension_splitter(sides=["out"])
         self.process.compute_flows(sides=["out"])
+        self.process.check_shares(sides=["out"])
 
 
 class StockDrivenDSM(DynamicStockModel):
@@ -355,19 +361,6 @@ class StockDrivenDSM(DynamicStockModel):
     This involves solving the lower triangular equation system A*x=b,
     where A is the survival function matrix, x is the inflow vector, and b is the stock vector.
     """
-
-    solver: str = "manual"
-    """Algorithm to use for solving the equation system.  Options are: "manual" (default), which uses
-    an own python implementation, and "lapack", which calls the lapack trtrs routine via scipy.
-    The lapack implementation may be more precise. Speed depends on the dimensionality,
-    but the manual implementation is usually faster.
-    """
-
-    @model_validator(mode="after")
-    def init_solver(self):
-        if self.solver not in ["manual", "lapack"]:
-            raise ValueError("Solver must be either 'manual' or 'lapack'.")
-        return self
 
     def _check_needed_arrays(self):
         super()._check_needed_arrays()
@@ -386,18 +379,6 @@ class StockDrivenDSM(DynamicStockModel):
         This involves solving the lower triangular equation system A*x=b,
         where A is the survival function matrix, x is the inflow vector, and b is the stock vector.
         """
-        if self.solver == "manual":
-            self._compute_cohorts_and_inflow_manual()
-        elif self.solver == "lapack":
-            self._compute_cohorts_and_inflow_lapack()
-        else:
-            raise ValueError(f"Unknown engine: {self.solver}")
-
-    def _compute_cohorts_and_inflow_manual(self) -> tuple[np.ndarray]:
-        """With given total stock and lifetime distribution,
-        the method builds the stock by cohort and the inflow,
-        using a manual algorithm for solving of the equation system (see "engine" doc for details).
-        """
         sf = self.lifetime_model.sf
         for m in range(self._n_t):
             self._stock_by_cohort[m, m, ...] = self.stock.values[m, ...] - self._stock_by_cohort[
@@ -408,19 +389,6 @@ class StockDrivenDSM(DynamicStockModel):
                 self.inflow.values[m, ...] * sf[m + 1 :, m, ...]
             )
 
-    def _compute_cohorts_and_inflow_lapack(self) -> tuple[np.ndarray]:
-        """With given total stock and lifetime distribution,
-        the method builds the stock by cohort and the inflow,
-        using lapack for solving of the equation system (see "engine" doc for details).
-        """
-        sf = self.lifetime_model.sf
-        slt = (slice(None),)
-        for i in np.ndindex(self._shape_no_t):
-            self.inflow.values[slt + i] = solve_triangular(
-                sf[2 * slt + i], self.stock.values[slt + i], lower=True
-            )
-        self._stock_by_cohort = np.einsum("c...,tc...->tc...", self.inflow.values, sf)
-
     def compute_process(self):
 
         self.compute()
@@ -428,7 +396,41 @@ class StockDrivenDSM(DynamicStockModel):
         self.process._total = self.outflow
         self.process.apply_dimension_splitter(sides=["out"])
         self.process.compute_flows(sides=["out"])
+        self.process.check_shares(sides=["out"])
 
         self.process._total = self.inflow
         self.process.apply_dimension_splitter(sides=["in"])
         self.process.compute_flows(sides=["in"])
+        self.process.check_shares(sides=["in"])
+
+
+class FlexibleDSM(DynamicStockModel):
+    """Computes either stock-driven or inflow-driven dynamic stock model, depending on which of the
+    stock or inflow is set.
+    """
+
+    compute_stock_driven = StockDrivenDSM.compute
+    compute_inflow_driven = InflowDrivenDSM.compute
+
+    _compute_cohorts_and_inflow = StockDrivenDSM._compute_cohorts_and_inflow
+    _compute_stock = InflowDrivenDSM._compute_stock
+
+    compute_process_stock_driven = StockDrivenDSM.compute_process
+    compute_process_inflow_driven = InflowDrivenDSM.compute_process
+
+    def compute(self):
+        if self.stock.is_set:
+            self.compute_stock_driven()
+        elif self.inflow.is_set:
+            self.compute_inflow_driven()
+        else:
+            raise ValueError("Either stock or inflow must be set for FlexibleDSM.compute().")
+
+    # replaces decorator, since inner functions are already decorated
+    compute.is_decorated = True
+
+    def compute_process(self):
+        if self.stock.is_set:
+            self.compute_process_stock_driven()
+        else:
+            self.compute_process_inflow_driven()

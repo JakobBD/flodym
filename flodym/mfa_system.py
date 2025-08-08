@@ -183,26 +183,23 @@ class MFASystem(PydanticBaseModel):
         dims = self.dims.get_subset(dim_letters)
         return FlodymArray(dims=dims, **kwargs)
 
-    def check_mass_balance(self, tolerance=None, error_behavior: ErrorBehavior = None):
+    def check_mass_balance(self, error_behavior: ErrorBehavior = None):
         """Compute mass balance, and check whether it is within a certain tolerance.
         Throw an error if it isn't.
 
         Args:
-            tolerance (float, optional): The tolerance for the mass balance check.
-                If None, defaults to 100 times the numpy float precision,
-                multiplied by the maximum absolute flow or stock value.
             error_behavior (ErrorBehavior): What to do if the mass balance check fails.
                 If None, takes the global config setting, which defaults to raising an error.
         """
 
         logging.info(f"Checking mass balance of {self.__class__.__name__} object...")
 
-        self.processes["sysenv"].check_mass_balance(tolerance=tolerance, error_behavior=error_behavior, mass_change_target=-self.total_stock_change,)
+        self.processes["sysenv"].check_mass_balance(tolerance=self.tolerance, error_behavior=error_behavior, mass_change_target=-self.total_stock_change,)
         for process in self.processes.values():
-            process.check_mass_balance(tolerance=tolerance, error_behavior=error_behavior)
+            process.check_mass_balance(tolerance=self.tolerance, error_behavior=error_behavior)
 
         for stock in self.stocks.values():
-            stock.check_mass_balance(tolerance=tolerance, error_behavior=error_behavior)
+            stock.check_mass_balance(tolerance=self.tolerance, error_behavior=error_behavior)
 
     @property
     def total_stock_change(self):
@@ -213,6 +210,13 @@ class MFASystem(PydanticBaseModel):
         max_flows = max(f._absolute_float_precision for f in self.flows.values())
         max_stocks = max(s.stock._absolute_float_precision for s in self.stocks.values())
         return max(max_flows, max_stocks)
+
+    @property
+    def tolerance(self) -> float:
+        """Get the absolute tolerance for checks, based on the system's float precision."""
+        if config.absolute_tolerance is not None:
+            return config.absolute_tolerance
+        return config.relative_tolerance * self._absolute_float_precision
 
     def check_flows(
         self, exceptions: list[str] = [], error_behavior: ErrorBehavior = None, verbose: bool = False
@@ -252,15 +256,12 @@ class MFASystem(PydanticBaseModel):
                 all_good = False
 
         # Check for negative values
-        tolerance = config.tolerance
-        if tolerance is None:
-            tolerance = 100 * self._absolute_float_precision
         for flow in flows:
-            if np.any(flow.values < -tolerance):
+            if np.any(flow.values < -self.tolerance):
                 message = f"Negative value in flow {flow.name}!"
                 if verbose:
                     message += f"\n Items:"
-                    indices = flow.items_where(lambda x: x < -tolerance)
+                    indices = flow.items_where(lambda x: x < -self.tolerance)
                     for index in indices:
                         message += "\n  " + ", ".join(index)
                 handle_error(behavior=error_behavior, message=message)
