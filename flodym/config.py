@@ -73,9 +73,15 @@ class Config(BaseModel, validate_assignment=True):
     error_behaviors: ErrorBehaviors = ErrorBehaviors()
     """What to do if a check fails."""
 
-    tolerance: Optional[confloat(ge=0)] = None
+    relative_tolerance: Optional[confloat(ge=0)] = 10.
+    """Tolerance relative to a float precision metric used for mass balance and other checks.
+    Increase if your mass balance checks fail due to rounding errors.
+    Overridden by `absolute_tolerance` if set.
+    """
+    absolute_tolerance: Optional[confloat(ge=0)] = None
     """Absolute tolerance used for mass balance and other checks.
-    If None, a default tolerance based on float precision is applied.
+    Overrides `relative_tolerance` if set.
+    If None, `relative_tolerance` is used.
     """
 
 config = Config()

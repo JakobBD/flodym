@@ -1,4 +1,4 @@
-from typing import List, Dict
+from typing import List, Dict, Optional
 from pydantic import BaseModel as PydanticBaseModel, model_validator
 import logging
 from functools import reduce
@@ -14,25 +14,12 @@ from .config import config, handle_error, ErrorBehavior
 class UnderdeterminedError(Exception):
     """Exception raised when a process is underdetermined."""
 
-    def __init__(self, process: "Process", stage: str, sides: List[str]):
-        message= f"Cannot compute process '{process.name}' with ID {process.id}, as it is underdetermined. \n"
-        if stage == "total":
-            message += "Failed to compute total flow of process from given in/outflows.\n"
-            for side in sides:
-                message += f"Tried to compute from {side}flows, but failed. Reasons:\n"
-                if not process.known_flows(side):
-                    message += f"- no flow from this side has an absolute value given\n"
-                for linked_process in process.neither_known(side):
-                    message += f"- for flow from/to process {linked_process}, neither share nor absolute value is given.\n"
-        elif stage == "flows":
-            for side in sides:
-                message += f"Failed to compute {side}flows from total; For more than one {side}flow, neither share nor absolute value was given.\n"
-                message += f"Please provide either share or absolute value for all but one of the flows from/to the processes "
-                message += ", ".join(process.neither_known(side)) + ".\n"
+    def __init__(self, process: "Process", message: str):
+        message = f"Cannot compute process '{process.name}' with ID {process.id}, as it is underdetermined. \n" + message
         super().__init__(message)
         self.message = message
 
-class Process(PydanticBaseModel):
+class Process(PydanticBaseModel, arbitrary_types_allowed=True):
     """Processes serve as nodes for the MFA system layout definition.
     Flows are defined between two processes. Stocks are connected to a process.
     Processes do not contain values themselves.
@@ -50,11 +37,12 @@ class Process(PydanticBaseModel):
     """Inflows to the process, keyed by linked process name."""
     _outflows: Dict[str, Flow] = {}
     """Outflows from the process, keyed by linked process name."""
-    dimension_splitter: "FlodymArray" = None
-    stock: Stock = None
+    dimension_splitter: Optional["FlodymArray"] = None
+    stock: Optional[Stock] = None
     _inflow_shares: Dict[str, "FlodymArray"] = {}
     _outflow_shares: Dict[str, "FlodymArray"] = {}
     _total: FlodymArray = None
+    _was_overdetermined: bool = None
 
     @model_validator(mode="after")
     def check_id0(self):
@@ -64,6 +52,9 @@ class Process(PydanticBaseModel):
                 "The process with ID 0 must be named 'sysenv', as it contains everything outside the system boundary."
             )
         return self
+
+    def __repr__(self):
+        return ""  # TODO
 
     @property
     def inflows(self) -> Dict[str, Flow]:
@@ -88,23 +79,23 @@ class Process(PydanticBaseModel):
         if from_process in self._inflows:
             del self._inflows[from_process]
         else:
-            raise ValueError(f"No inflow from process '{from_process}' found.")
+            raise ValueError(f"In process {self.name}: No inflow from process '{from_process}' found.")
 
     def remove_outflow(self, to_process: str) -> None:
         """Remove an outflow from the process."""
         if to_process in self._outflows:
             del self._outflows[to_process]
         else:
-            raise ValueError(f"No outflow to process '{to_process}' found.")
+            raise ValueError(f"In process {self.name}: No outflow to process '{to_process}' found.")
 
     def add_inflow_share(self, from_process: str, share: FlodymArray):
         if from_process not in self._inflows:
-            raise ValueError(f"No inflow from process '{from_process}' found.")
+            raise ValueError(f"In process {self.name}: Cannot add inflow share from process {from_process}, as no such inflow found.")
         self._inflow_shares[from_process] = share
 
     def add_outflow_share(self, to_process: str, share: FlodymArray):
         if to_process not in self._outflows:
-            raise ValueError(f"No outflow to process '{to_process}' found.")
+            raise ValueError(f"In process {self.name}: Cannot add outflow share to process {to_process}, as no such outflow found.")
         self._outflow_shares[to_process] = share
 
     def remove_inflow_share(self, from_process: str):
@@ -112,14 +103,14 @@ class Process(PydanticBaseModel):
         if from_process in self._inflow_shares:
             del self._inflow_shares[from_process]
         else:
-            raise ValueError(f"No inflow share for process '{from_process}' found.")
+            raise ValueError(f"In process {self.name}: No inflow share for process '{from_process}' found.")
 
     def remove_outflow_share(self, to_process: str):
         """Remove the outflow share for a given process."""
         if to_process in self._outflow_shares:
             del self._outflow_shares[to_process]
         else:
-            raise ValueError(f"No outflow share for process '{to_process}' found.")
+            raise ValueError(f"In process {self.name}: No outflow share for process '{to_process}' found.")
 
     @property
     def is_computed(self) -> bool:
@@ -139,11 +130,15 @@ class Process(PydanticBaseModel):
             return
         try:
 
-            was_overdetermined = self.is_overdetermined
+            self._was_overdetermined = self.is_overdetermined
             self.try_compute()
 
-            if config.checks.process_shares:
-                self.check_shares(was_overdetermined=was_overdetermined)
+            if not self.is_computed:
+                raise ValueError(
+                    f"In Process {self.name}: After computation, there are still unknown flows. "
+                    "This indicates an internal flodym error."
+                )
+
             if config.checks.mass_balance_processes:
                 self.check_mass_balance()
 
@@ -167,16 +162,13 @@ class Process(PydanticBaseModel):
         else:
             self.stock.compute_process()
 
-        if self.unknown_flows("in") or self.unknown_flows("out"):
-            raise ValueError(
-                f"In Process {self.name}: After computation, there are still unknown flows. "
-                "This indicates an internal flodym error."
-            )
-
     def compute_no_stock(self):
+        if self.name == "fabrication":
+            pass
         self.compute_total()
         self.apply_dimension_splitter()
         self.compute_flows()
+        self.check_shares()
 
     def flows(self, direction: str):
         if direction == "in":
@@ -225,7 +217,8 @@ class Process(PydanticBaseModel):
 
     def can_compute_total(self, from_side: str) -> bool:
         """Check if the process can compute the total flow through the process in the given direction."""
-        return len(self.neither_known(from_side)) == 0 and len(self.known_flows(from_side)) >= 1
+        return (self.both_known(from_side) or
+            (len(self.neither_known(from_side)) == 0 and len(self.known_flows(from_side)) >= 1))
 
     def can_compute_flows(self, sides: List[str] = ["in", "out"]) -> bool:
         """Check if the process can compute the flows in the given direction."""
@@ -239,7 +232,8 @@ class Process(PydanticBaseModel):
                 side = s
                 break
         if side is None:
-            raise UnderdeterminedError(process=self, stage="total", sides=try_sides)
+            message = self.get_underdetermined_error_message_total(try_sides)
+            raise UnderdeterminedError(process=self, message=message)
 
         if len(self.known_flows(side)) == len(self.flows(side)):
             # all flows are known
@@ -273,6 +267,24 @@ class Process(PydanticBaseModel):
                 )
             sum_shares_unknown = sum([s.cast_to(dims_unknown) for s in shares_unknown.values()])
             self._total = sum_known / (1 - sum_shares_unknown)
+
+    def get_underdetermined_error_message_total(self, sides: List[str]) -> str:
+        message = "Failed to compute total flow of process from given in/outflows.\n"
+        for side in sides:
+            message += f"Tried to compute from {side}flows, but failed. Reasons:\n"
+            if not self.known_flows(side):
+                message += f"- no flow from this side has an absolute value given\n"
+            for linked_process in self.neither_known(side):
+                message += f"- for flow from/to process {linked_process}, neither share nor absolute value is given.\n"
+        return message
+
+    def get_underdetermined_error_message_flows(self, sides: List[str]) -> str:
+        message = ""
+        for side in sides:
+            message += f"Failed to compute {side}flows from total; For more than one {side}flow, neither share nor absolute value was given.\n"
+            message += f"Please provide either share or absolute value for all but one of the flows from/to the processes "
+            message += ", ".join(self.neither_known(side)) + ".\n"
+        return message
 
     def apply_dimension_splitter(self, sides: list[str] = ["in", "out"]):
         """Apply the dimension splitter to the total flow."""
@@ -320,7 +332,8 @@ class Process(PydanticBaseModel):
         """Compute the flows based on the total flow."""
 
         if not self.can_compute_flows(sides):
-            raise UnderdeterminedError(process=self, stage="flow", sides=sides)
+            message = self.get_underdetermined_error_message_flows(sides)
+            raise UnderdeterminedError(process=self, message=message)
 
         for side in sides:
             # saving in temp flow avoids reducing dimensions.
@@ -358,8 +371,10 @@ class Process(PydanticBaseModel):
             for flow_name, flow in temp_flows.items():
                 self.flows(side)[flow_name][...] = flow
 
-    def check_shares(self, was_overdetermined: bool):
-        for side in ["in", "out"]:
+    def check_shares(self, sides: List[str] = ["in", "out"]):
+        if not config.checks.process_shares:
+            return
+        for side in sides:
             for name, share in self.shares(side).items():
                 error = self._total * share - self.flows(side)[name]
                 max_error = np.max(np.abs(error.values))
@@ -368,7 +383,7 @@ class Process(PydanticBaseModel):
                         f"after computation of process {self.name}: Share of flow to/from process "
                         f"{name} is not fulfilled (error = {max_error})."
                     )
-                    if was_overdetermined:
+                    if self._was_overdetermined:
                         message += (
                             "This may be due to the process being overdetermined."
                             "If it is not intentional, consider removing some shares or given flows."
@@ -380,9 +395,24 @@ class Process(PydanticBaseModel):
                         message=message
                     )
 
-    @property
-    def net_inflow(self):
-        return sum(self.inflows.values()) - sum(self.outflows.values())
+    def get_sum_inflows(self) -> FlodymArray:
+        """Sum of all inflows to the process."""
+        if not self.is_computed:
+            raise ValueError(f"Cannot compute sum_inflows for process {self.name} before it is computed.")
+        if not self.inflows:
+            return 0.
+        return sum(self.inflows.values())
+
+    def get_sum_outflows(self) -> FlodymArray:
+        """Sum of all outflows from the process."""
+        if not self.is_computed:
+            raise ValueError(f"Cannot compute sum_outflows for process {self.name} before it is computed.")
+        if not self.outflows:
+            return 0.
+        return sum(self.outflows.values())
+
+    def get_net_inflow(self):
+        return self.get_sum_inflows() - self.get_sum_outflows()
 
     @property
     def _absolute_float_precision(self) -> float:
@@ -400,15 +430,17 @@ class Process(PydanticBaseModel):
     @property
     def tolerance(self) -> float:
         """The tolerance for checks like mass balance"""
-        if config.tolerance is not None:
-            return config.tolerance
-        return 10 * self._absolute_float_precision
+        if config.absolute_tolerance is not None:
+            return config.absolute_tolerance
+        return config.relative_tolerance * self._absolute_float_precision
 
-    def check_mass_balance(self, error_behavior: ErrorBehavior = None, mass_change_target: FlodymArray = None):
+    def check_mass_balance(self, tolerance: float = None, error_behavior: ErrorBehavior = None, mass_change_target: FlodymArray = None):
         """Compute mass balance, and check whether it is within a certain tolerance.
         Throw an error if it isn't.
 
         Args:
+            tolerance (float, optional): A tolerance override for the mass balance check.
+                If None, takes the  processes's own tolerance
             error_behavior (ErrorBehavior): What to do if the mass balance check fails.
                 If None, takes the global config setting, which defaults to raising an error
         """
@@ -422,9 +454,11 @@ class Process(PydanticBaseModel):
         if mass_change_target is None:
             mass_change_target = 0. if self.stock is None else self.stock.net_inflow
         # net_inflow = mass_change, so the difference should be zero
-        mass_balance = self.net_inflow - mass_change_target
+        mass_balance = self.get_net_inflow() - mass_change_target
         max_error =  np.max(np.abs(mass_balance.values))
-        if max_error > self.tolerance:
+        if tolerance is None:
+            tolerance = self.tolerance
+        if max_error > tolerance:
             message = f"In process {self.name}: Mass balance check failed (error = {max_error})"
             if error_behavior is None:
                 error_behavior = config.error_behaviors.mass_balance
