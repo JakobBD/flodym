@@ -122,6 +122,42 @@ class Process(PydanticBaseModel, arbitrary_types_allowed=True):
         return True
 
     def compute(self, on_underdetermined: ErrorBehavior = "error", recursive: bool=False) -> None:
+        """Compute all unknown flows of the process, based on topological information and known in/outflows.
+        This covers most cases of MFA processes, but not all.
+        Sometimes manual computations are still necessary.
+        For example, if there is a 2x2 equation system to solve (see example 1).
+
+        Topological information needed for this includes:
+        - the inflows and outflows
+        - the shares of some in- or outflows relative to the process total
+        - an array to multiply with to apply a dimension split
+
+        The computation assumes the following process structure:
+        - one or several inflows
+        - combined into a total
+        - possible dimension change
+        - one or several outflows
+        Though quite general, this applies some restrictions on the possible process layouts.
+        For example, no dimension expansion of individual in- or outflows through multiplication with shares is allowed.
+        However, this can be realized by adding an own process which only applies this dimension splitting.
+
+        The computation follows the following steps:
+        - Detect if the total can be calculated from either the known inflows and inflow shares (forward mode),
+          or from the known outflows and outflow shares (backward mode)
+          Let's assume forward mode in the following, but backward mode works in the same way.
+          The total can be calculated...
+          - If all inflows are given, the total is simply their sum.
+          - If a flow and its share are given, the total is that flow divided by its share
+          - If the shares of all unknown flows are given, the total is t = sum(known_flows) / (1 - sum(shares_of_unknown_flows))
+          If none of the three conditions is met on neither side (in/out), then the total cannot be calculated, and thus the whole
+          process cannot be calculated.
+        - Detect if there is a dimension_splitter and if it provides dimension information that the total does not have.
+          If this is the case, apply dimension splitter by multiplying the total with it
+        - Compute unknown flows. All but one unknown flows on each side need a share. Each of these unknown outflows with share
+          is then calculated as total * share. If there is one remaining unknown flow without share, it is calculated as
+          total - sum(known_flows_of_this_side).
+          If more than one unknown flow on one side has no share defined, it cannot be calculated, and thus the whole process cannot be calculated.
+        """
         if self.is_computed:
             logging.debug(f"Process {self.name} with ID {self.id} is already computed.")
             return
@@ -254,7 +290,7 @@ class Process(PydanticBaseModel, arbitrary_types_allowed=True):
             dims_unknown = reduce(
                 lambda x, y: x | y.dims, shares_unknown.values(), DimensionSet(dim_list=[])
             )
-            if shares_unknown - sum_known.dims:
+            if dims_unknown - sum_known.dims:
                 share_names = ", ".join(
                     [name for name, share in shares_unknown.items() if share.dims - sum_known.dims]
                 )
