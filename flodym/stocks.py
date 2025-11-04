@@ -57,6 +57,7 @@ class Stock(PydanticBaseModel):
     """Process the stock is associated with, if any. Needed for example for the mass balance."""
     time_letter: str = "t"
     """Letter of the time dimension in the dimensions set, to make sure it's the first one."""
+    _t: UnevenTimeDim = None
 
     @model_validator(mode="after")
     def validate_stock_arrays(self):
@@ -100,6 +101,11 @@ class Stock(PydanticBaseModel):
             raise RuntimeError(
                 "Stock.compute method must have the stock_compute_decorator applied to it."
             )
+        return self
+
+    @model_validator(mode="after")
+    def init_t(self):
+        self._t = UnevenTimeDim(dim=self.dims[self.time_letter])
         return self
 
     @abstractmethod
@@ -209,6 +215,19 @@ class Stock(PydanticBaseModel):
             and self.stock.is_set
         )
 
+    def _to_whole_period(self, annual_flow: np.ndarray) -> np.ndarray:
+        """multiply annual flow by interval length to get flow over whole period."""
+        return np.einsum("t...,t->t...", annual_flow, self._t.interval_lengths)
+
+    def _to_annual(self, whole_period_flow: np.ndarray) -> np.ndarray:
+        """divide flow over whole period by interval length to get annual flow"""
+        return np.einsum("t...,t->t...", whole_period_flow, 1.0 / self._t.interval_lengths)
+
+    def __str__(self):
+        base = f"{self.__class__.__name__} '{self.name}'"
+        dims = f" with dims ({','.join(self.dims.letters)}) and shape {self.shape};"
+        return base + dims
+
 
 class SimpleFlowDrivenStock(Stock):
     """Given inflows and outflows, the stock can be calculated without a lifetime model or cohorts."""
@@ -222,8 +241,10 @@ class SimpleFlowDrivenStock(Stock):
 
     @stock_compute_decorator
     def compute(self):
-        net_inflow = self.net_inflow * self.time_interval_length
-        self.stock[...] = net_inflow.apply(np.cumsum, kwargs={"axis": 0})
+        self._check_needed_arrays()
+        annual_net_inflow = self.inflow.values - self.outflow.values
+        net_inflow_whole_period = self._to_whole_period(annual_net_inflow)
+        self.stock.values[...] = np.cumsum(net_inflow_whole_period, axis=0)
 
     def compute_process(self):
         if self.process.inflows:
@@ -315,6 +336,11 @@ class DynamicStockModel(Stock):
         )
         self.outflow.values[...] = self._outflow_by_cohort.sum(axis=1)
 
+    def __str__(self):
+        base = super().__str__()
+        lifetime_model = self.lifetime_model.__class__.__name__
+        return base + "\n  Lifetime model: " + lifetime_model
+
 
 class InflowDrivenDSM(DynamicStockModel):
     """Inflow driven model.
@@ -333,8 +359,10 @@ class InflowDrivenDSM(DynamicStockModel):
         self._compute_outflow()
 
     def _compute_stock(self):
+        # for non-contiguous years, yearly inflow is multiplied with time interval length
+        inflow_per_period = self._to_whole_period(self.inflow.values)
         self._stock_by_cohort = np.einsum(
-            "c...,tc...->tc...", self.inflow.values, self.lifetime_model.sf
+            "c...,tc...->tc...", inflow_per_period, self.lifetime_model.sf
         )
         self.stock.values[...] = self._stock_by_cohort.sum(axis=1)
 
@@ -379,15 +407,26 @@ class StockDrivenDSM(DynamicStockModel):
         This involves solving the lower triangular equation system A*x=b,
         where A is the survival function matrix, x is the inflow vector, and b is the stock vector.
         """
-        sf = self.lifetime_model.sf
-        for m in range(self._n_t):
-            self._stock_by_cohort[m, m, ...] = self.stock.values[m, ...] - self._stock_by_cohort[
-                m, 0:m, ...
-            ].sum(axis=0)
-            self.inflow.values[m, ...] = self._stock_by_cohort[m, m, ...] / sf[m, m, ...]
-            self._stock_by_cohort[m + 1 :, m, ...] = (
-                self.inflow.values[m, ...] * sf[m + 1 :, m, ...]
-            )
+        # Maths behind implementation:
+        # Solve square linear equation system
+        #   sf * inflow = stock
+        # where sf is a lower triangular matrix (since year >= cohort)
+        # => in every row i:
+        #   sum_{j=1...i} (sf_i,j inflow_j) = stock_i
+        # solve for inflow_i:
+        #   inflow_i = ( stock_i - sum_{j=1...i-1}(sf_i,j * inflow_j) ) / sf_ii
+        inflow_whole_period = np.zeros_like(self.inflow.values)
+        for i in range(self._n_t):
+            stock_i = self.stock.values[i, ...]
+            sf_ij = self.lifetime_model.sf[i, :i, ...]
+            inflow_j = inflow_whole_period[:i, ...]
+            sf_ii = self.lifetime_model.sf[i, i, ...]
+
+            inflow_whole_period[i, ...] = (stock_i - (sf_ij * inflow_j).sum(axis=0)) / sf_ii
+        self.inflow.values[...] = self._to_annual(inflow_whole_period)
+        self._stock_by_cohort = np.einsum(
+            "c...,tc...->tc...", self.inflow.values, self.lifetime_model.sf
+        )
 
     def compute_process(self):
 

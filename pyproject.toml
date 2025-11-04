@@ -1,11 +1,12 @@
 [project]
 name = "flodym"
-version = "0.5.0"
+version = "0.5.1"
 authors = [
     {name = "Jakob Dürrwächter"},
     {name = "Sally Dacie"},
     {name = "Merlin Hosak"},
     {name = "Bennet Weiß"},
+    {name = "Leonie Schweiger"},
 ]
 readme = "README.md"
 requires-python = ">= 3.10"
@@ -19,6 +20,7 @@ dependencies = [
     "plotly>=5.18.0",
     "pydantic>=2.8.2",
     "openpyxl>=3.1.5",
+    "tabulate>=0.9.0",
 ]
 
 [project.optional-dependencies]

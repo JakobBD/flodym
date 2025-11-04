@@ -97,6 +97,16 @@ class Dimension(PydanticBaseModel):
         """Check if the items of this dimension are a superset of the items of another dimension."""
         return set(self.items).issuperset(other.items)
 
+    def __str__(self):
+        base = f"Dimension '{self.name}' ('{self.letter}'); "
+        item_base = f"{self.len} items"
+        type_info = f" (type {self.dtype})" if self.dtype is not None else ""
+        if self.len <= 3:
+            list_str = f": {str(self.items)}"
+        else:
+            list_str = f": ['{self.items[0]}', ..., '{self.items[-1]}']"
+        return base + item_base + type_info + list_str
+
 
 class DimensionSet(PydanticBaseModel):
     """A set of Dimension objects which MFA arrays are defined over.
@@ -138,7 +148,7 @@ class DimensionSet(PydanticBaseModel):
         return self
 
     @property
-    def _dict(self) -> Dict[str, Dimension]:
+    def _full_mapping(self) -> Dict[str, Dimension]:
         """Contains mappings.
 
         letter --> dim object and name --> dim object
@@ -160,7 +170,7 @@ class DimensionSet(PydanticBaseModel):
         if isinstance(key, tuple):
             return self.get_subset(key)
         if isinstance(key, str):
-            return self._dict[key]
+            return self._full_mapping[key]
         elif isinstance(key, int):
             return self.dim_list[key]
         else:
@@ -170,7 +180,7 @@ class DimensionSet(PydanticBaseModel):
         return iter(self.dim_list)
 
     def __contains__(self, key: str) -> bool:
-        return key in self._dict
+        return key in self._full_mapping
 
     def size(self, key: str):
         """get the number of items in a dimension
@@ -178,7 +188,7 @@ class DimensionSet(PydanticBaseModel):
         Args:
             key (str): the name or letter of the dimension to get the size of
         """
-        return self._dict[key].len
+        return self._full_mapping[key].len
 
     @property
     def shape(self) -> tuple[int]:
@@ -192,7 +202,7 @@ class DimensionSet(PydanticBaseModel):
         """
         subset = copy(self)
         if dims is not None:
-            subset.dim_list = [self._dict[dim_key] for dim_key in dims]
+            subset.dim_list = [self._full_mapping[dim_key] for dim_key in dims]
         return subset
 
     def expand_by(self, added_dims: list[Dimension]) -> "DimensionSet":
@@ -213,7 +223,7 @@ class DimensionSet(PydanticBaseModel):
         Returns:
             None if inplace=True, otherwise a new DimensionSet with the dimension removed
         """
-        dim_to_drop = self._dict[key]
+        dim_to_drop = self._full_mapping[key]
         if inplace:
             self.dim_list.remove(dim_to_drop)
             return
@@ -329,5 +339,17 @@ class DimensionSet(PydanticBaseModel):
         return "".join(self.letters)
 
     def index(self, key):
-        """Return the index of a dimension in the set."""
-        return [d.letter for d in self.dim_list].index(key)
+        """Return the index of a dimension in the set.
+
+        Args:
+            key (str): The name or letter of the dimension to get the index of
+        """
+        dim = self._full_mapping[key]
+        return self.dim_list.index(dim)
+
+    def __str__(self):
+        base = f"DimensionSet ({','.join(self.letters)}) with shape {self.shape}:"
+        dim_strs = [
+            f"\n  '{dim.letter}': '{dim.name}' with length {dim.len}" for dim in self.dim_list
+        ]
+        return base + "".join(dim_strs)
