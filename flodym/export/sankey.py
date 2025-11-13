@@ -153,8 +153,10 @@ class PlotlySankeyPlotter(CustomNameDisplayer, PydanticBaseModel):
             colors = color[1]
             splitting_letter_tuple = (self.mfa.dims[split_flows_by].letter,)
             values = f_slice.sum_values_to(splitting_letter_tuple)
-            for v, c in zip(values, colors):
-                links.append(label=label, source=source, target=target, color=c, value=v)
+            for v, c, l in zip(values, colors, self.mfa.dims[split_flows_by].items):
+                links.append(
+                    label=str(self.display_name(l)), source=source, target=target, color=c, value=v
+                )
         else:
             links.append(
                 label=label,
