@@ -107,6 +107,33 @@ class Dimension(PydanticBaseModel):
             list_str = f": ['{self.items[0]}', ..., '{self.items[-1]}']"
         return base + item_base + type_info + list_str
 
+# NOTES:
+# - only allow strings in both
+# - forbid pipe in any item
+# - sub-dimensions are dimension objects
+# - expand adjust sum_over, sum_to
+# - adjust DimensionSet.__contains__? Any other methods?
+# - adjust indexing?
+
+class NestedDimension(Dimension):
+
+    parent: Dimension
+    sub_items: Dict[str, list]
+    items: Optional[list] = None
+    """do not use"""
+
+    # validator (before)
+    # - check that no items are given
+
+    # validator (after)
+    def generate_items(self):
+        """Generate items from sub_items keys."""
+        self.items = list(self.sub_items.keys())
+        return self
+
+    def get_aggregator(self):
+        pass
+
 
 class DimensionSet(PydanticBaseModel):
     """A set of Dimension objects which MFA arrays are defined over.
