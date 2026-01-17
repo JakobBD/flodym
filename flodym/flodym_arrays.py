@@ -534,7 +534,8 @@ class FlodymArray(PydanticBaseModel):
         """
         slice_obj = self._sub_array_handler(keys)
         if isinstance(item, FlodymArray):
-            self.values[slice_obj.ids] = item.sum_values_to(slice_obj.dim_letters)
+            values = item.sum_values_to(slice_obj.dim_letters)
+            self.values[slice_obj.ids] = slice_obj.reorder_for_setitem(values)
         elif isinstance(keys, type(Ellipsis)):
             self.set_values(copy(item))
         else:
@@ -754,7 +755,79 @@ class SubArrayHandler:
     @property
     def values_pointer(self):
         """Pointer to the subset of the values array of the parent FlodymArray object."""
-        return self.flodym_array.values[self.ids]
+        result = self.flodym_array.values[self.ids]
+        # Fix dimension ordering if list indices are non-contiguous with other advanced indices
+        if self._needs_dimension_order_fix():
+            result = self._fix_advanced_indexing_order(result)
+        return result
+
+    def _needs_dimension_order_fix(self):
+        """Check if dimension order fix is needed.
+        
+        NumPy moves array-indexed dimensions to the front when advanced indices
+        (arrays AND scalars) are separated by basic indexing (slices).
+        """
+        if not self._list_index_axes:
+            return False
+        # Find all advanced index positions (arrays and scalars)
+        advanced_axes = []
+        for i, ids in enumerate(self._id_list):
+            if not isinstance(ids, slice):
+                advanced_axes.append(i)
+        if len(advanced_axes) < 2:
+            return False
+        # Check if there are any slices between advanced indices
+        first_adv = advanced_axes[0]
+        last_adv = advanced_axes[-1]
+        for i in range(first_adv + 1, last_adv):
+            if isinstance(self._id_list[i], slice):
+                return True
+        return False
+
+    def _fix_advanced_indexing_order(self, result):
+        """Fix dimension ordering after NumPy advanced indexing.
+        
+        When advanced array indices are separated by slices from other advanced
+        indices, NumPy moves the array-indexed dimensions to the front.
+        """
+        n_list_axes = len(self._list_index_axes)
+        # Count scalars before each axis to calculate target positions
+        scalar_count_before = []
+        count = 0
+        for i, ids in enumerate(self._id_list):
+            scalar_count_before.append(count)
+            if isinstance(ids, (int, np.integer)):
+                count += 1
+        
+        # Target positions for the list-indexed axes (adjusted for scalar removal)
+        target_positions = [ax - scalar_count_before[ax] for ax in self._list_index_axes]
+        source_positions = list(range(n_list_axes))
+        
+        return np.moveaxis(result, source_positions, target_positions)
+
+    def reorder_for_setitem(self, values):
+        """Reorder values to match NumPy's advanced indexing order for setitem.
+        
+        This is the inverse of _fix_advanced_indexing_order - it moves dimensions
+        from their logical positions to where NumPy expects them.
+        """
+        if not self._needs_dimension_order_fix():
+            return values
+        
+        n_list_axes = len(self._list_index_axes)
+        scalar_count_before = []
+        count = 0
+        for i, ids in enumerate(self._id_list):
+            scalar_count_before.append(count)
+            if isinstance(ids, (int, np.integer)):
+                count += 1
+        
+        # Source positions are where dimensions currently are (logical order)
+        source_positions = [ax - scalar_count_before[ax] for ax in self._list_index_axes]
+        # Target positions are where NumPy expects them (at the front)
+        target_positions = list(range(n_list_axes))
+        
+        return np.moveaxis(values, source_positions, target_positions)
 
     def _init_dims_out(self):
         self.dims_out = deepcopy(self.flodym_array.dims)
@@ -797,12 +870,14 @@ class SubArrayHandler:
     def _convert_lists_to_cartesian_product(self):
         """If there are several dimensions with lists, numpy will try to broadcast the lists together.
         To avoid this, convert all id lists to their cartesian product of indices, using np.ix_.
+        Also track which axes have list indices for fixing dimension order later.
         """
-        axes_with_id_lists = [i for i, ids in enumerate(self._id_list) if isinstance(ids, list)]
+        self._list_index_axes = [i for i, ids in enumerate(self._id_list) if isinstance(ids, list)]
         id_lists = [ids for ids in self._id_list if isinstance(ids, list)]
-        mesh_of_ids = np.ix_(*id_lists)
-        for i_axis, ids_mesh in zip(axes_with_id_lists, mesh_of_ids):
-            self._id_list[i_axis] = ids_mesh
+        if id_lists:
+            mesh_of_ids = np.ix_(*id_lists)
+            for i_axis, ids_mesh in zip(self._list_index_axes, mesh_of_ids):
+                self._id_list[i_axis] = ids_mesh
 
     def _set_ids_single_dim(self, dim_letter, item_or_items):
         """Given either a single item name or a list of item names, return the corresponding item IDs, along one
