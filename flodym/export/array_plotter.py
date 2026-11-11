@@ -224,10 +224,12 @@ class ArrayPlotter(CustomNameDisplayer, ABC):
             zip(linedict_array.values(), linedict_x_array.values(), linedict_array.keys())
         ):
             label = self.line_label if self.line_label is not None else self.display_name(name_line)
-            assert array_line.dims.names == (intra_line_dim_name,), (
-                "All dimensions of array must be given exactly once. Either as x_dim / subplot_dim / linecolor_dim, or in "
-                "slice_dict or summed_dims."
-            )
+            if array_line.dims.names != (intra_line_dim_name,):
+                raise ValueError(
+                    "All dimensions of array must be given exactly once. Either as x_dim / "
+                    "subplot_dim / linecolor_dim, or in slice_dict or summed_dims. Dimensions "
+                    f"left for a line: {array_line.dims.names}."
+                )
             self._add_line(i_subplot, x_array_line.values, array_line.values, prev_y, label, i_line)
             prev_y = array_line.values
 

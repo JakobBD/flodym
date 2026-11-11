@@ -629,3 +629,26 @@ def test_extend_is_alias_of_expand_by():
     assert dims.extend([region]).letters == dims.expand_by([region]).letters == ("t", "r")
     dims.extend([region], inplace=True)
     assert dims.letters == ("t", "r")
+
+
+def test_duplicate_items_are_rejected():
+    with pytest.raises(FlodymValidationError, match="these occur more than once: 'a', 'c'"):
+        Dimension(name="Region", letter="r", items=["a", "b", "a", "c", "c"])
+
+
+def test_dimension_lookup_error_lists_dimensions():
+    dims = DimensionSet(
+        dim_list=[
+            Dimension(name="Region", letter="r", items=["a"]),
+            Dimension(name="Time", letter="t", items=[2020]),
+        ]
+    )
+    expected = (
+        "No dimension with name or letter 'Regoin'. Did you mean 'Region'? Dimensions: "
+        "'Region' (r), 'Time' (t)."
+    )
+    with pytest.raises(KeyError) as error:
+        dims["Regoin"]
+    assert str(error.value) == expected
+    with pytest.raises(KeyError, match="letter 's'"):
+        dims.get_subset(("r", "s"))

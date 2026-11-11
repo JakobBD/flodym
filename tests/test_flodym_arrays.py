@@ -182,7 +182,7 @@ def test_get_shares_over():
     assert_array_almost_equal(shares.values, ANIMAL_VALUES / np.sum(ANIMAL_VALUES))
 
     # example of getting shares over a dimension that doesn't exist
-    with pytest.raises(AssertionError):
+    with pytest.raises(ValueError, match="Dimensions to get share of"):
         SPACE_ANIMALS.get_shares_over(dim_letters=("s",))
 
 
@@ -386,7 +386,7 @@ def test_from_df_does_not_strip_whitespace_when_disabled():
     )
     dims_subset = DimensionSet(dim_list=[selected_places, HISTORIC_TIME])
 
-    with pytest.raises(ValueError, match="More than one value columns"):
+    with pytest.raises(ValueError, match="Could not determine which column"):
         FlodymArray.from_df(dims=dims_subset, df=df, strip_whitespace=False)
 
 

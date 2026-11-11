@@ -339,6 +339,11 @@ class FlodymArray(FlodymBaseModel):
                 be given.
                 Dimensions with only one item do not need to be given in the DataFrame.
                 Supersets of dimensions (i.e. additional values) will lead to an error.
+                Further columns, e.g. units or comments, are ignored if this is unambiguous:
+                in long format, if the value column is named ``value`` and all dimension columns
+                are named by dimension name or letter; in wide format, if they are right of the
+                value columns and contain no numbers. Rows and unnamed columns without any entry
+                are ignored.
             allow_missing_values: Whether to allow missing values in the DataFrame.
                 This includes both missing rows, and NaN values in the value column.
                 Defaults to False.
@@ -348,10 +353,15 @@ class FlodymArray(FlodymBaseModel):
             strip_whitespace: Whether to strip whitespace from string values in the DataFrame.
                 Defaults to True.
             **kwargs: Additional keyword arguments passed to the FlodymArray constructor
-                (e.g., name).
+                (e.g., name). Giving the name is recommended, as error messages name it.
 
         Returns:
             FlodymArray object with the values from the DataFrame
+
+        Raises:
+            FlodymDataError: If the DataFrame does not fit the dimensions. The message names the
+                problem, e.g. items that are not in a dimension, with their labels in the index
+                of the DataFrame.
         """
         flodym_array = cls(dims=dims, **kwargs)
         flodym_array.set_values_from_df(
@@ -443,11 +453,12 @@ class FlodymArray(FlodymBaseModel):
         refined = self._to_resolution(target_dims, coarsen=False)
         if refined is not self:
             return refined.cast_values_to(target_dims)
-        assert all(d in target_dims.letters for d in self.dims.letters), (
-            "Target of cast must contain all "
-            f"dimensions of the object! Source dims '{self.dims.string}' are not all contained in target dims "
-            f"'{target_dims.string}'. Maybe use sum_values_to() before casting"
-        )
+        if not all(d in target_dims.letters for d in self.dims.letters):
+            raise ValueError(
+                "Target of cast must contain all dimensions of the object! Source dims "
+                f"'{self.dims.string}' are not all contained in target dims "
+                f"'{target_dims.string}'. Maybe use sum_values_to() before casting"
+            )
         # safety procedure: order dimensions
         axes = [self.dims.letters.index(d) for d in target_dims.letters if d in self.dims.letters]
         values = np.transpose(self.values, axes)
@@ -942,9 +953,11 @@ class FlodymArray(FlodymBaseModel):
         Returns:
             The other object converted to a FlodymArray object.
         """
-        assert isinstance(other, (FlodymArray, Number)), (
-            "Can only perform operations between two FlodymArrays or FlodymArray and scalar."
-        )
+        if not isinstance(other, (FlodymArray, Number)):
+            raise TypeError(
+                "Can only perform operations between two FlodymArrays or FlodymArray and scalar. "
+                f"Given: {type(other).__name__}."
+            )
         if isinstance(other, Number):
             other = FlodymArray(dims=self.dims, values=np.full(self.shape, other))
         self._check_is_set("a math operation")
@@ -1400,6 +1413,11 @@ class FlodymArray(FlodymBaseModel):
                 be given.
                 Dimensions with only one item do not need to be given in the DataFrame.
                 Supersets of dimensions (i.e. additional values) will lead to an error.
+                Further columns, e.g. units or comments, are ignored if this is unambiguous:
+                in long format, if the value column is named ``value`` and all dimension columns
+                are named by dimension name or letter; in wide format, if they are right of the
+                value columns and contain no numbers. Rows and unnamed columns without any entry
+                are ignored.
             allow_missing_values: Whether to allow missing values in the DataFrame.
                 This includes both missing rows, and NaN values in the value column.
                 Defaults to False.
@@ -1408,6 +1426,11 @@ class FlodymArray(FlodymBaseModel):
                 Defaults to False.
             strip_whitespace: Whether to strip whitespace from string values in the DataFrame.
                 Defaults to True.
+
+        Raises:
+            FlodymDataError: If the DataFrame does not fit the dimensions. The message names the
+                problem, e.g. items that are not in a dimension, with their labels in the index
+                of the DataFrame.
         """
         converter = DataFrameToFlodymDataConverter(
             df_in,
@@ -1446,9 +1469,12 @@ class FlodymArray(FlodymBaseModel):
         """
         if isinstance(dim_letters, str):
             dim_letters = (dim_letters,)
-        assert all(d in self.dims.letters for d in dim_letters), (
-            "Dimensions to get share of must be in the object"
-        )
+        unknown = [d for d in dim_letters if d not in self.dims.letters]
+        if unknown:
+            raise ValueError(
+                f"Dimensions to get share of must be in the object. Not in the dimensions "
+                f"'{self.dims.string}': {unknown}."
+            )
 
         if all(d in dim_letters for d in self.dims.letters):
             return self / self.sum_to(())

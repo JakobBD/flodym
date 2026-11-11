@@ -38,3 +38,14 @@ assigned to configuration options.
 
 .. autoexception:: flodym.FlodymValidationError
    :members:
+
+Data errors
+------------------------------
+
+Data that do not fit the flodym object they are read for raise a
+:py:class:`flodym.FlodymDataError`, e.g. a DataFrame whose columns cannot be assigned to the
+dimensions of a parameter, items that are not in a dimension, or values that are not numbers.
+The message first names where the data came from, e.g. the parameter and the file, and then
+describes the problem.
+
+.. autoexception:: flodym.FlodymDataError
