@@ -3,7 +3,7 @@
 import difflib
 import types
 import typing
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from typing import Any, SupportsFloat
 
 import numpy as np
@@ -20,6 +20,15 @@ _TYPE_NAMES: dict[Any, str] = {
     SupportsFloat: "a number (type SupportsFloat)",
 }
 """Readable names of types in error messages. Other classes are named by their class name."""
+
+MAX_LISTED_VALUES = 5
+"""Maximum number of values, e.g. items or index labels, listed in an error message."""
+
+_MIN_SIMILARITY = 0.6
+"""Minimum similarity ratio of :py:class:`difflib.SequenceMatcher` for suggesting a name."""
+
+_MIN_SIMILARITY_LEAD = 0.1
+"""Minimum lead in similarity of a suggested name over the second most similar name."""
 
 
 class FlodymValidationError(ValueError):
@@ -46,6 +55,100 @@ class FlodymValidationError(ValueError):
 
 
 FlodymValidationError.__module__ = "flodym"
+
+
+class FlodymDataError(ValueError):
+    """Raised if data read from a file or DataFrame do not fit the flodym object they are for.
+
+    Examples are a DataFrame whose columns cannot be assigned to the dimensions of a
+    :py:class:`flodym.FlodymArray`, items that are not in a dimension, or values that are not
+    numbers. The first lines of the message name where the data came from, e.g. the parameter and
+    the file. The following lines describe the problem.
+
+    It is a subclass of ``ValueError``, so that ``except ValueError`` also catches it.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self._subject: str | None = None
+        """What was read when the error occurred, e.g. ``"parameter 'p'"``, once a context names
+        it. Used to avoid naming it twice."""
+
+    def _add_context(self, context: str, subject: str | None = None) -> None:
+        """Prepend a line which says where the problem occurred, and indent the previous message.
+
+        Args:
+            context: Description of the step in which the error occurred, ending with a colon.
+            subject: What was read in this step, e.g. ``"parameter 'p'"``, if the context names
+                it.
+        """
+        self.args = (f"{context}\n  " + str(self).replace("\n", "\n  "),)
+        if subject is not None:
+            self._subject = subject
+
+
+FlodymDataError.__module__ = "flodym"
+
+
+def did_you_mean(given: Any, choices: Iterable[Any]) -> str:
+    """Suggest the choice that ``given`` was probably meant to be, as part of an error message.
+
+    See :py:func:`closest_name` for how the choice is found.
+
+    Returns:
+        ``" Did you mean '<choice>'?"``, or an empty string if there is no suggestion.
+    """
+    closest = closest_name(given, choices)
+    return "" if closest is None else f" Did you mean '{closest}'?"
+
+
+def closest_name(given: Any, choices: Iterable[Any]) -> str | None:
+    """The choice that ``given`` was probably meant to be, if any.
+
+    A choice that differs only in case, whitespace, ``_`` or ``-`` is returned. Otherwise the
+    most similar choice is returned, if it is similar enough and clearly more similar than the
+    second most similar one. Numbers and strings of digits, e.g. years, get no suggestion, as
+    similar digits do not indicate a typo.
+    """
+    if not isinstance(given, str) or given.strip().lstrip("-").isdigit():
+        return None
+    candidates = [choice for choice in choices if isinstance(choice, str) and choice != given]
+    normalized = _normalize_name(given)
+    same_name = [choice for choice in candidates if _normalize_name(choice) == normalized]
+    if same_name:
+        return same_name[0]
+    ratios = sorted(
+        (
+            (difflib.SequenceMatcher(None, normalized, _normalize_name(choice)).ratio(), choice)
+            for choice in candidates
+        ),
+        key=lambda ratio_and_choice: ratio_and_choice[0],
+        reverse=True,
+    )
+    if not ratios or ratios[0][0] < _MIN_SIMILARITY:
+        return None
+    if len(ratios) > 1 and ratios[0][0] - ratios[1][0] < _MIN_SIMILARITY_LEAD:
+        return None
+    return ratios[0][1]
+
+
+def list_values(values: Iterable[Any]) -> str:
+    """Comma-separated representation of the first values, with the total number if shortened."""
+    values = list(values)
+    listed = ", ".join(repr(to_builtin(value)) for value in values[:MAX_LISTED_VALUES])
+    if len(values) > MAX_LISTED_VALUES:
+        listed += f", ... ({len(values)} in total)"
+    return listed
+
+
+def to_builtin(value: Any) -> Any:
+    """Convert numpy scalars to Python scalars, so that ``repr`` does not show the numpy type."""
+    return value.item() if isinstance(value, np.generic) else value
+
+
+def _normalize_name(name: str) -> str:
+    """Lower-case name without whitespace, ``_`` and ``-``, to compare names leniently."""
+    return "".join(name.lower().replace("_", " ").replace("-", " ").split())
 
 
 class FlodymBaseModel(PydanticBaseModel):
@@ -192,9 +295,7 @@ def _unknown_argument_problem(argument: str, parent: str, valid_names: list[str]
     message = f"- '{argument}' is not a valid argument" + (f" of {parent}." if parent else ".")
     if not valid_names:
         return message
-    suggestions = difflib.get_close_matches(argument, valid_names, n=1)
-    if suggestions:
-        message += f" Did you mean '{suggestions[0]}'?"
+    message += did_you_mean(argument, valid_names)
     return message + f"\n  Valid arguments: {', '.join(valid_names)}."
 
 

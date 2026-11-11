@@ -7,7 +7,12 @@ import pytest
 
 import flodym
 from flodym import Dimension, FlowDefinition, StockDefinition
-from flodym._base_model import FlodymBaseModel, ValidatedAssignmentModel, _describe_value
+from flodym._base_model import (
+    FlodymBaseModel,
+    ValidatedAssignmentModel,
+    _describe_value,
+    closest_name,
+)
 from flodym.example_objects import ExampleMFA, get_example_array, get_example_mfa
 from flodym.export.array_plotter import PlotlyArrayPlotter
 from flodym.stocks import SimpleFlowDrivenStock
@@ -334,3 +339,30 @@ def test_describe_value_of_other_array_like_gives_shape_in_one_line():
     # the module of DataFrame is "pandas" in newer pandas versions, else "pandas.core.frame"
     assert description.startswith("pandas.")
     assert description.endswith("DataFrame with shape (2, 1)")
+
+
+REGIONS = ["Germany", "France", "Czechia", "China", "EU", "US"]
+CARS = ["gasoline passenger car", "electric passenger cars", "diesel passenger car"]
+
+
+@pytest.mark.parametrize(
+    "given, choices, expected",
+    [
+        ("Germny", REGIONS, "Germany"),
+        ("germany", REGIONS, "Germany"),
+        ("drive_technology", ["region", "drive technology", "time"], "drive technology"),
+        ("Regoin", ["region", "drive technology", "time"], "region"),
+        ("gasoline passenger cars", CARS, "gasoline passenger car"),
+        # not similar enough
+        ("UX", REGIONS, None),
+        ("Turkiye", REGIONS, None),
+        ("unit nominator", ["region", "drive technology", "time"], None),
+        # several choices are about equally similar
+        ("hybrid passenger car", CARS, None),
+        # numbers and digit strings: similar digits do not indicate a typo
+        ("2065", ["2060", "2061"], None),
+        (2065, [2060], None),
+    ],
+)
+def test_closest_name(given, choices, expected):
+    assert closest_name(given, choices) == expected

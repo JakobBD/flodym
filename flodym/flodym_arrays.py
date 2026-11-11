@@ -327,18 +327,22 @@ class FlodymArray(FlodymBaseModel):
         Args:
             dims: Dimensions of the FlodymArray
             df: pandas DataFrame containing the values of the FlodymArray.
-                Dimensions of the named dim array can be given in DataFrame columns or the index.
-                The DataFrame can be in long or wide format, that is there can either be one value
-                column, or the value columns are named by items of one FlodymArray dimension.
-                If dimension names or letters are not given in the respective index or column, they
-                are inferred from the items of the dimensions of the FlodymArray.
-                It is advisable to give the dimension names in the DataFrame, as this makes the
-                error messages more informative if there are typos in the items or if items are
-                missing.
-                Ordering of rows and columns is arbitrary, but the items across each dimension must
-                be given.
-                Dimensions with only one item do not need to be given in the DataFrame.
-                Supersets of dimensions (i.e. additional values) will lead to an error.
+                Dimension columns must be named by dimension name or letter. They can also be
+                index levels with these names. Dimensions with only one item need no column.
+                The layout follows from the column names:
+
+                - Long format, if there is a column ``value``, or every dimension has a
+                  column: the values are in column ``value``, or else in the only further
+                  column. Other columns, e.g. units or comments, are ignored.
+                - Wide format, if exactly one dimension has no column, and column names are
+                  items of it: these columns hold the values. Further columns are ignored if
+                  they contain no numbers.
+
+                Ordering of rows and columns is arbitrary. Items that are not in a dimension
+                lead to an error, unless ``allow_extra_values`` is set. Rows and unnamed
+                columns without any entry are ignored. For arrays with a single value, a
+                DataFrame without rows and with a number as only column name is accepted: this
+                is how pandas reads a file with a single field.
             allow_missing_values: Whether to allow missing values in the DataFrame.
                 This includes both missing rows, and NaN values in the value column.
                 Defaults to False.
@@ -348,10 +352,15 @@ class FlodymArray(FlodymBaseModel):
             strip_whitespace: Whether to strip whitespace from string values in the DataFrame.
                 Defaults to True.
             **kwargs: Additional keyword arguments passed to the FlodymArray constructor
-                (e.g., name).
+                (e.g., name). Giving the name is recommended, as error messages name it.
 
         Returns:
             FlodymArray object with the values from the DataFrame
+
+        Raises:
+            FlodymDataError: If the DataFrame does not fit the dimensions. The message names the
+                problem, e.g. items that are not in a dimension, with their labels in the index
+                of the DataFrame.
         """
         flodym_array = cls(dims=dims, **kwargs)
         flodym_array.set_values_from_df(
@@ -443,11 +452,12 @@ class FlodymArray(FlodymBaseModel):
         refined = self._to_resolution(target_dims, coarsen=False)
         if refined is not self:
             return refined.cast_values_to(target_dims)
-        assert all(d in target_dims.letters for d in self.dims.letters), (
-            "Target of cast must contain all "
-            f"dimensions of the object! Source dims '{self.dims.string}' are not all contained in target dims "
-            f"'{target_dims.string}'. Maybe use sum_values_to() before casting"
-        )
+        if not all(d in target_dims.letters for d in self.dims.letters):
+            raise ValueError(
+                "Target of cast must contain all dimensions of the object! Source dims "
+                f"'{self.dims.string}' are not all contained in target dims "
+                f"'{target_dims.string}'. Maybe use sum_values_to() before casting"
+            )
         # safety procedure: order dimensions
         axes = [self.dims.letters.index(d) for d in target_dims.letters if d in self.dims.letters]
         values = np.transpose(self.values, axes)
@@ -942,9 +952,11 @@ class FlodymArray(FlodymBaseModel):
         Returns:
             The other object converted to a FlodymArray object.
         """
-        assert isinstance(other, (FlodymArray, Number)), (
-            "Can only perform operations between two FlodymArrays or FlodymArray and scalar."
-        )
+        if not isinstance(other, (FlodymArray, Number)):
+            raise TypeError(
+                "Can only perform operations between two FlodymArrays or FlodymArray and scalar. "
+                f"Given: {type(other).__name__}."
+            )
         if isinstance(other, Number):
             other = FlodymArray(dims=self.dims, values=np.full(self.shape, other))
         self._check_is_set("a math operation")
@@ -1388,18 +1400,22 @@ class FlodymArray(FlodymBaseModel):
 
         Args:
             df_in: pandas DataFrame containing the values of the FlodymArray.
-                Dimensions of the named dim array can be given in DataFrame columns or the index.
-                The DataFrame can be in long or wide format, that is there can either be one value
-                column, or the value columns are named by items of one FlodymArray dimension.
-                If dimension names or letters are not given in the respective index or column, they
-                are inferred from the items of the dimensions of the FlodymArray.
-                It is advisable to give the dimension names in the DataFrame, as this makes the
-                error messages more informative if there are typos in the items or if items are
-                missing.
-                Ordering of rows and columns is arbitrary, but the items across each dimension must
-                be given.
-                Dimensions with only one item do not need to be given in the DataFrame.
-                Supersets of dimensions (i.e. additional values) will lead to an error.
+                Dimension columns must be named by dimension name or letter. They can also be
+                index levels with these names. Dimensions with only one item need no column.
+                The layout follows from the column names:
+
+                - Long format, if there is a column ``value``, or every dimension has a
+                  column: the values are in column ``value``, or else in the only further
+                  column. Other columns, e.g. units or comments, are ignored.
+                - Wide format, if exactly one dimension has no column, and column names are
+                  items of it: these columns hold the values. Further columns are ignored if
+                  they contain no numbers.
+
+                Ordering of rows and columns is arbitrary. Items that are not in a dimension
+                lead to an error, unless ``allow_extra_values`` is set. Rows and unnamed
+                columns without any entry are ignored. For arrays with a single value, a
+                DataFrame without rows and with a number as only column name is accepted: this
+                is how pandas reads a file with a single field.
             allow_missing_values: Whether to allow missing values in the DataFrame.
                 This includes both missing rows, and NaN values in the value column.
                 Defaults to False.
@@ -1408,6 +1424,11 @@ class FlodymArray(FlodymBaseModel):
                 Defaults to False.
             strip_whitespace: Whether to strip whitespace from string values in the DataFrame.
                 Defaults to True.
+
+        Raises:
+            FlodymDataError: If the DataFrame does not fit the dimensions. The message names the
+                problem, e.g. items that are not in a dimension, with their labels in the index
+                of the DataFrame.
         """
         converter = DataFrameToFlodymDataConverter(
             df_in,
@@ -1446,9 +1467,12 @@ class FlodymArray(FlodymBaseModel):
         """
         if isinstance(dim_letters, str):
             dim_letters = (dim_letters,)
-        assert all(d in self.dims.letters for d in dim_letters), (
-            "Dimensions to get share of must be in the object"
-        )
+        unknown = [d for d in dim_letters if d not in self.dims.letters]
+        if unknown:
+            raise ValueError(
+                f"Dimensions to get share of must be in the object. Not in the dimensions "
+                f"'{self.dims.string}': {unknown}."
+            )
 
         if all(d in dim_letters for d in self.dims.letters):
             return self / self.sum_to(())

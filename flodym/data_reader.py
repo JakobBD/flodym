@@ -1,15 +1,107 @@
 """Home to some data readers."""
 
+import os
+import sys
 import warnings
 from abc import ABC, abstractmethod
+from collections.abc import Callable, Mapping
 from os import PathLike
-from typing import Any
+from typing import Any, TypeVar
 
 import pandas as pd
 
+from ._base_model import FlodymDataError, did_you_mean, list_values
 from .dimensions import Dimension, DimensionSet
 from .flodym_arrays import Parameter
 from .mfa_definition import DimensionDefinition, ParameterDefinition, _dimension_dependency_order
+
+ReadResult = TypeVar("ReadResult")
+
+
+def _lookup(mapping: Mapping[str, Any], key: str, argument_name: str, what: str) -> Any:
+    """Get the entry of a reader argument such as ``parameter_files`` for a parameter or dimension.
+
+    Raises:
+        FlodymDataError: If there is no entry for ``key``, with the given keys and a suggestion.
+    """
+    if key in mapping:
+        return mapping[key]
+    raise FlodymDataError(
+        f"No entry for {what} '{key}' in {argument_name}.{did_you_mean(key, mapping)} "
+        f"Given entries: {list_values(mapping) or 'none'}."
+    )
+
+
+def _read_with_context(
+    read: Callable[[], ReadResult],
+    subject: str,
+    path: str | PathLike[str],
+    argument_name: str,
+    sheet_name: str | int | None = None,
+    index_note: str = "",
+) -> ReadResult:
+    """Run ``read``, and name the file and what is read from it in errors.
+
+    Args:
+        read: Function that reads the file and creates the flodym object.
+        subject: What is read, e.g. ``"parameter 'p'"``.
+        path: The file that is read.
+        argument_name: Name of the reader argument which gives the file, e.g.
+            ``"parameter_files"``.
+        sheet_name: The sheet that is read, for Excel files.
+        index_note: Explanation of the index of the read DataFrame, which error messages use
+            to name rows, e.g. ``" (index = row number in the file)"``.
+
+    Raises:
+        FileNotFoundError: If the file does not exist, with the absolute path.
+        FlodymDataError: If the data are invalid, or pandas cannot read them.
+    """
+    sheet = f", sheet {sheet_name!r}" if isinstance(sheet_name, str) else ""
+    context = f"Could not read {subject} from file '{path}'{sheet}{index_note}:"
+    try:
+        return read()
+    except FileNotFoundError as error:
+        raise FileNotFoundError(
+            f"The file for {subject} given in {argument_name} does not exist: '{path}'. "
+            f"Relative paths are relative to the working directory, '{os.getcwd()}'."
+        ) from error
+    except FlodymDataError as error:
+        error._add_context(context, subject)
+        raise
+    except ValueError as error:
+        # e.g. errors of pandas when parsing the file, or invalid arguments of flodym classes
+        message = str(error) if type(error) is ValueError else f"{type(error).__name__}: {error}"
+        wrapped = FlodymDataError(message)
+        wrapped._add_context(context, subject)
+        raise wrapped from error
+
+
+def _add_reading_context(error: BaseException, context: str, subject: str) -> None:
+    """Name what was read when an error occurred in a method of a reader.
+
+    For a :py:class:`flodym.FlodymDataError`, the context is prepended to the message, unless the
+    message already names what was read. Other errors are not changed, as their type may matter
+    to the caller, but get a note (Python 3.11 and later), which is shown below the traceback.
+    """
+    if isinstance(error, FlodymDataError):
+        if error._subject != subject:
+            error._add_context(context, subject)
+    elif sys.version_info >= (3, 11):
+        error.add_note(context.rstrip(":"))
+
+
+def _keeps_file_rows(read_kwargs: dict[str, Any]) -> bool:
+    """Whether data read with these keyword arguments start in row 2 of the file, after a header.
+
+    This holds for pandas' default header, index and skipped rows. Then the index of the read
+    DataFrame can be set to the row numbers in the file, which error messages use to name rows.
+    """
+    return not any(key in read_kwargs for key in ("header", "skiprows", "index_col", "nrows"))
+
+
+def _set_index_to_file_rows(data: pd.DataFrame) -> None:
+    """Set the index of data read with header in row 1 to the row numbers in the file."""
+    data.index = pd.RangeIndex(2, len(data) + 2)
 
 
 def _is_allowed_for(allowed: bool | list[str], parameter_name: str) -> bool:
@@ -51,23 +143,40 @@ class DataReader(ABC):
         """
         dimensions: dict[str, Dimension] = {}
         for definition in _dimension_dependency_order(dimension_definitions):
-            if definition.splitting is not None:
-                dimensions[definition.letter] = _split_dimension(definition, dimensions)
-                continue
-            if definition.combine_splits is not None:
-                upper, *lower = (dimensions[letter] for letter in definition.combine_splits)
-                combined = Dimension.combine_splits(
-                    name=definition.name, letter=definition.letter, upper=upper, lower=lower
+            try:
+                dimensions[definition.letter] = self._create_dimension(definition, dimensions)
+            except Exception as error:
+                _add_reading_context(
+                    error,
+                    f"While reading dimension '{definition.name}' ({definition.letter}) with "
+                    f"{type(self).__name__}:",
+                    f"dimension '{definition.name}'",
                 )
-                dimensions[definition.letter] = Dimension.model_validate(
-                    {**dict(combined), "dtype": definition.dtype}
-                )
-                continue
-            dimension = self.read_dimension(definition)
-            if definition.parent is not None:
-                dimension = _link_parent(dimension, definition, dimensions[definition.parent])
-            dimensions[definition.letter] = dimension
+                raise
         return DimensionSet(dim_list=[dimensions[d.letter] for d in dimension_definitions])
+
+    def _create_dimension(
+        self, definition: DimensionDefinition, dimensions: dict[str, Dimension]
+    ) -> Dimension:
+        """Read a dimension, or create it from the dimensions it depends on.
+
+        Args:
+            definition: Definition of the dimension.
+            dimensions: Already created dimensions by letter, including those the definition
+                depends on.
+        """
+        if definition.splitting is not None:
+            return _split_dimension(definition, dimensions)
+        if definition.combine_splits is not None:
+            upper, *lower = (dimensions[letter] for letter in definition.combine_splits)
+            combined = Dimension.combine_splits(
+                name=definition.name, letter=definition.letter, upper=upper, lower=lower
+            )
+            return Dimension.model_validate({**dict(combined), "dtype": definition.dtype})
+        dimension = self.read_dimension(definition)
+        if definition.parent is not None:
+            dimension = _link_parent(dimension, definition, dimensions[definition.parent])
+        return dimension
 
     @abstractmethod
     def read_dimension(self, definition: DimensionDefinition) -> Dimension:
@@ -95,10 +204,20 @@ class DataReader(ABC):
         parameters = {}
         for parameter_definition in parameter_definitions:
             dim_subset = dims.get_subset(parameter_definition.dim_letters)
-            parameter = self.read_parameter_values(
-                parameter_name=parameter_definition.name,
-                dims=dim_subset,
-            )
+            try:
+                parameter = self.read_parameter_values(
+                    parameter_name=parameter_definition.name,
+                    dims=dim_subset,
+                )
+            except Exception as error:
+                dims_text = ", ".join(f"{dim.name} ({dim.letter})" for dim in dim_subset)
+                _add_reading_context(
+                    error,
+                    f"While reading parameter '{parameter_definition.name}' with dimensions "
+                    f"{dims_text or 'none'} with {type(self).__name__}.read_parameter_values:",
+                    f"parameter '{parameter_definition.name}'",
+                )
+                raise
             if parameter_definition.extensive is not None:
                 parameter.extensive = parameter_definition.extensive
             parameters[parameter_definition.name] = parameter
@@ -112,6 +231,7 @@ class DimensionReader(ABC):
     """
 
     read_dimensions = DataReader.read_dimensions
+    _create_dimension = DataReader._create_dimension
 
     @abstractmethod
     def read_dimension(self, definition: DimensionDefinition) -> Dimension:
@@ -141,12 +261,21 @@ class CSVDimensionReader(DimensionReader):
         self.read_csv_kwargs = read_csv_kwargs
 
     def read_dimension(self, definition: DimensionDefinition) -> Dimension:
-        """Read the items of a dimension from the CSV file given for the dimension name."""
-        path = self.dimension_files[definition.name]
+        """Read the items of a dimension from the CSV file given for the dimension name.
+
+        Raises:
+            FlodymDataError: If no file is given for the dimension, or its data are invalid.
+            FileNotFoundError: If the file does not exist.
+        """
+        path = _lookup(self.dimension_files, definition.name, "dimension_files", "dimension")
         if "header" not in self.read_csv_kwargs:
             self.read_csv_kwargs["header"] = None
-        df = pd.read_csv(path, **self.read_csv_kwargs)
-        return Dimension.from_df(df, definition)
+
+        def read() -> Dimension:
+            df = pd.read_csv(path, **self.read_csv_kwargs)
+            return Dimension.from_df(df, definition)
+
+        return _read_with_context(read, f"dimension '{definition.name}'", path, "dimension_files")
 
 
 class ExcelDimensionReader(DimensionReader):
@@ -175,18 +304,31 @@ class ExcelDimensionReader(DimensionReader):
         self.read_excel_kwargs = read_excel_kwargs
 
     def read_dimension(self, definition: DimensionDefinition) -> Dimension:
-        """Read the items of a dimension from the Excel file and sheet given for its name."""
-        path = self.dimension_files[definition.name]
-        # load data from excel
+        """Read the items of a dimension from the Excel file and sheet given for its name.
+
+        Raises:
+            FlodymDataError: If no file or sheet is given for the dimension, or its data are
+                invalid.
+            FileNotFoundError: If the file does not exist.
+        """
+        path = _lookup(self.dimension_files, definition.name, "dimension_files", "dimension")
         if self.dimension_sheets is None:
             sheet_name = 0  # first sheet; None would make pandas read all sheets into a dict
         else:
-            sheet_name = self.dimension_sheets[definition.name]
+            sheet_name = _lookup(
+                self.dimension_sheets, definition.name, "dimension_sheets", "dimension"
+            )
         # default for header is None
         if "header" not in self.read_excel_kwargs:
             self.read_excel_kwargs["header"] = None
-        df = pd.read_excel(path, sheet_name=sheet_name, **self.read_excel_kwargs)
-        return Dimension.from_df(df, definition)
+
+        def read() -> Dimension:
+            df = pd.read_excel(path, sheet_name=sheet_name, **self.read_excel_kwargs)
+            return Dimension.from_df(df, definition)
+
+        return _read_with_context(
+            read, f"dimension '{definition.name}'", path, "dimension_files", sheet_name
+        )
 
 
 class ParameterReader(ABC):
@@ -261,18 +403,31 @@ class CSVParameterReader(ParameterReader):
         """Read the values of a parameter from the CSV file given for the parameter name.
 
         Raises:
-            ValueError: If no parameter files were specified.
+            FlodymDataError: If no file is given for the parameter, or its data are invalid.
+            FileNotFoundError: If the file does not exist.
         """
-        if not self.parameter_files:
-            raise ValueError("No parameter files specified.")
-        datasets_path = self.parameter_files[parameter_name]
-        data = pd.read_csv(datasets_path, **self.read_csv_kwargs)
-        return Parameter.from_df(
-            dims=dims,
-            name=parameter_name,
-            df=data,
-            allow_missing_values=_is_allowed_for(self.allow_missing_values, parameter_name),
-            allow_extra_values=_is_allowed_for(self.allow_extra_values, parameter_name),
+        path = _lookup(self.parameter_files, parameter_name, "parameter_files", "parameter")
+        keeps_file_rows = _keeps_file_rows(self.read_csv_kwargs)
+
+        def read() -> Parameter:
+            data = pd.read_csv(path, **self.read_csv_kwargs)
+            if keeps_file_rows:
+                _set_index_to_file_rows(data)
+            return Parameter.from_df(
+                dims=dims,
+                name=parameter_name,
+                df=data,
+                allow_missing_values=_is_allowed_for(self.allow_missing_values, parameter_name),
+                allow_extra_values=_is_allowed_for(self.allow_extra_values, parameter_name),
+            )
+
+        index_note = (
+            " (index = line number in the file, if it has no empty lines)"
+            if keeps_file_rows
+            else ""
+        )
+        return _read_with_context(
+            read, f"parameter '{parameter_name}'", path, "parameter_files", index_note=index_note
         )
 
 
@@ -318,19 +473,42 @@ class ExcelParameterReader(ParameterReader):
         self.read_excel_kwargs = read_excel_kwargs
 
     def read_parameter_values(self, parameter_name: str, dims: DimensionSet) -> Parameter:
-        """Read the values of a parameter from the Excel file and sheet given for its name."""
-        datasets_path = self.parameter_files[parameter_name]
+        """Read the values of a parameter from the Excel file and sheet given for its name.
+
+        Raises:
+            FlodymDataError: If no file or sheet is given for the parameter, or its data are
+                invalid.
+            FileNotFoundError: If the file does not exist.
+        """
+        path = _lookup(self.parameter_files, parameter_name, "parameter_files", "parameter")
         if self.parameter_sheets is None:
             sheet_name = 0  # first sheet; None would make pandas read all sheets into a dict
         else:
-            sheet_name = self.parameter_sheets[parameter_name]
-        data = pd.read_excel(datasets_path, sheet_name=sheet_name, **self.read_excel_kwargs)
-        return Parameter.from_df(
-            dims=dims,
-            name=parameter_name,
-            df=data,
-            allow_missing_values=_is_allowed_for(self.allow_missing_values, parameter_name),
-            allow_extra_values=_is_allowed_for(self.allow_extra_values, parameter_name),
+            sheet_name = _lookup(
+                self.parameter_sheets, parameter_name, "parameter_sheets", "parameter"
+            )
+        keeps_file_rows = _keeps_file_rows(self.read_excel_kwargs)
+
+        def read() -> Parameter:
+            data = pd.read_excel(path, sheet_name=sheet_name, **self.read_excel_kwargs)
+            if keeps_file_rows:
+                _set_index_to_file_rows(data)
+            return Parameter.from_df(
+                dims=dims,
+                name=parameter_name,
+                df=data,
+                allow_missing_values=_is_allowed_for(self.allow_missing_values, parameter_name),
+                allow_extra_values=_is_allowed_for(self.allow_extra_values, parameter_name),
+            )
+
+        index_note = " (index = row number in the file)" if keeps_file_rows else ""
+        return _read_with_context(
+            read,
+            f"parameter '{parameter_name}'",
+            path,
+            "parameter_files",
+            sheet_name,
+            index_note=index_note,
         )
 
 

@@ -1,9 +1,14 @@
+import sys
+
 import numpy as np
+import pandas as pd
 import pytest
 
+from flodym import Dimension, DimensionSet, FlodymDataError, Parameter
 from flodym.data_reader import (
     CSVDimensionReader,
     CSVParameterReader,
+    DataReader,
     ExcelDimensionReader,
     ExcelParameterReader,
 )
@@ -293,3 +298,119 @@ def test_parameter_filenames_is_deprecated():
     with pytest.warns(DeprecationWarning, match="parameter_files"):
         reader.parameter_filenames = {}
     assert reader.parameter_files == {}
+
+
+class UnnamedParameterReader(DataReader):
+    """Custom reader as in user code: calls ``from_df`` without the parameter name."""
+
+    def __init__(self, df: pd.DataFrame) -> None:
+        self.df = df
+
+    def read_dimension(self, definition: DimensionDefinition) -> Dimension:
+        items = {"time": [2020, 2021], "region": ["Germany", "France"]}[definition.name]
+        return Dimension(name=definition.name, letter=definition.letter, items=items)
+
+    def read_parameter_values(self, parameter_name: str, dims: DimensionSet) -> Parameter:
+        if parameter_name == "key error":
+            raise KeyError("column 'x'")
+        return Parameter.from_df(dims=dims, df=self.df)
+
+
+READ_DEFINITIONS = [
+    DimensionDefinition(name="time", letter="t", dtype=int),
+    DimensionDefinition(name="region", letter="r", dtype=str),
+]
+
+
+def test_custom_reader_error_names_parameter_definition():
+    df = pd.DataFrame({"region": ["Germany", "Frnace"], "time": [2020, 2021], "value": [1, 2]})
+    reader = UnnamedParameterReader(df)
+    dims = reader.read_dimensions(READ_DEFINITIONS)
+    definitions = [ParameterDefinition(name="lifetime", dim_letters=("r",))]
+    with pytest.raises(FlodymDataError) as error:
+        reader.read_parameters(definitions, dims)
+    lines = str(error.value).splitlines()
+    assert lines[0] == (
+        "While reading parameter 'lifetime' with dimensions region (r) with "
+        "UnnamedParameterReader.read_parameter_values:"
+    )
+    assert lines[1].startswith("  While setting values of an unnamed Parameter")
+    assert "'Frnace' (index 1; did you mean 'France'?)" in lines[2]
+
+
+def test_custom_reader_keeps_type_of_other_errors():
+    reader = UnnamedParameterReader(pd.DataFrame())
+    dims = reader.read_dimensions(READ_DEFINITIONS)
+    definitions = [ParameterDefinition(name="key error", dim_letters=("r",))]
+    with pytest.raises(KeyError) as error:
+        reader.read_parameters(definitions, dims)
+    if sys.version_info >= (3, 11):
+        assert "While reading parameter 'key error'" in error.value.__notes__[0]
+
+
+def test_missing_entry_in_reader_arguments():
+    reader = CSVParameterReader({"lifetime": "lifetime.csv"})
+    dims = DimensionSet(dim_list=[Dimension(name="time", letter="t", items=[2020])])
+    with pytest.raises(FlodymDataError, match="'lifetme' in parameter_files. Did you mean"):
+        reader.read_parameter_values("lifetme", dims)
+    excel_reader = ExcelParameterReader({"p": "p.xlsx"}, parameter_sheets={"q": "Data"})
+    with pytest.raises(FlodymDataError, match="'p' in parameter_sheets. Given entries: 'q'."):
+        excel_reader.read_parameter_values("p", dims)
+    dimension_reader = CSVDimensionReader({"time": "time.csv"})
+    with pytest.raises(FlodymDataError, match="'region' in dimension_files"):
+        dimension_reader.read_dimension(READ_DEFINITIONS[1])
+
+
+def test_missing_file_names_parameter_and_working_directory():
+    reader = CSVParameterReader({"lifetime": "does_not_exist.csv"})
+    dims = DimensionSet(dim_list=[Dimension(name="time", letter="t", items=[2020])])
+    with pytest.raises(FileNotFoundError, match="parameter 'lifetime' .* working directory"):
+        reader.read_parameter_values("lifetime", dims)
+
+
+def test_file_reader_error_names_file_and_row(tmp_path):
+    csv_path = tmp_path / "lifetime.csv"
+    pd.DataFrame({"time": [2020, 2021, 2022], "value": [1, 2, 3]}).to_csv(csv_path, index=False)
+    excel_path = tmp_path / "lifetime.xlsx"
+    pd.DataFrame({"time": [2020, 2021, 2022], "value": [1, 2, 3]}).to_excel(
+        excel_path, sheet_name="Data", index=False
+    )
+    dims = DimensionSet(dim_list=[Dimension(name="time", letter="t", items=[2020, 2021])])
+    definitions = [ParameterDefinition(name="lifetime", dim_letters=("t",))]
+
+    with pytest.raises(FlodymDataError) as error:
+        CSVParameterReader({"lifetime": csv_path}).read_parameters(definitions, dims)
+    lines = str(error.value).splitlines()
+    assert lines[0] == (
+        f"Could not read parameter 'lifetime' from file '{csv_path}' (index = line number in the "
+        "file, if it has no empty lines):"
+    )
+    assert lines[1].startswith("  While setting values of Parameter 'lifetime'")
+    assert "2022 (index 4)" in lines[2]
+    assert "While reading parameter" not in str(error.value)
+
+    reader = ExcelParameterReader({"lifetime": excel_path}, parameter_sheets={"lifetime": "Data"})
+    with pytest.raises(FlodymDataError) as error:
+        reader.read_parameters(definitions, dims)
+    assert "sheet 'Data' (index = row number in the file):" in str(error.value)
+    assert "2022 (index 4)" in str(error.value)
+
+
+def test_dimension_reader_errors(tmp_path):
+    path = tmp_path / "time.csv"
+    pd.DataFrame({"year": [2020, 2021]}).to_csv(path, index=False)
+    reader = CSVDimensionReader({"time": path})
+    with pytest.raises(FlodymDataError) as error:
+        reader.read_dimensions([READ_DEFINITIONS[0]])
+    message = str(error.value)
+    assert message.startswith(f"Could not read dimension 'time' from file '{path}':")
+    assert "cannot be converted to the type int given in its definition: 'year'" in message
+    assert "If 'year' is a header, it must be the dimension name 'time'." in message
+
+    pd.DataFrame({"time": ["2020", "2020"]}).to_csv(path, index=False)
+    with pytest.raises(FlodymDataError, match="must be unique, but these occur more than once"):
+        reader.read_dimension(READ_DEFINITIONS[0])
+
+    path.write_text("")
+    with pytest.raises(FlodymDataError, match="EmptyDataError"):
+        reader.read_dimension(READ_DEFINITIONS[0])

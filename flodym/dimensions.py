@@ -10,8 +10,16 @@ import numpy as np
 import pandas as pd
 from pydantic import AliasChoices, Field, model_validator
 
-from ._base_model import FlodymBaseModel
+from ._base_model import FlodymBaseModel, FlodymDataError, did_you_mean, list_values
 from .mfa_definition import DimensionDefinition
+
+
+class _DimensionNotFoundError(KeyError):
+    """Raised if a dimension is not found by its name or letter."""
+
+    def __str__(self) -> str:
+        # KeyError would show the message in quotes, as it shows the repr of the missing key
+        return str(self.args[0])
 
 
 class Dimension(FlodymBaseModel):
@@ -72,6 +80,22 @@ class Dimension(FlodymBaseModel):
     split into. For dimensions created by :py:meth:`combine_splits`, also the lower split for
     the items of the further ancestor which are split. Slicing an array by one of the keys returns
     an array over the corresponding dimension."""
+
+    @model_validator(mode="after")
+    def _items_are_unique(self) -> Dimension:
+        """Check that no item occurs more than once."""
+        seen: set[Any] = set()
+        duplicates = []
+        for item in self.items:
+            if item in seen:
+                duplicates.append(item)
+            seen.add(item)
+        if duplicates:
+            raise ValueError(
+                f"Items of dimension '{self.name}' must be unique, but these occur more than "
+                f"once: {list_values(dict.fromkeys(duplicates))}."
+            )
+        return self
 
     @model_validator(mode="after")
     def _items_have_datatype(self) -> Dimension:
@@ -180,23 +204,25 @@ class Dimension(FlodymBaseModel):
             The dimension object.
 
         Raises:
-            ValueError: If more than one axis of the array has a size larger than one, or if the
-                definition has a parent and the array does not have two columns.
+            FlodymDataError: If more than one axis of the array has a size larger than one, if
+                the definition has a parent and the array does not have two columns, if there
+                are no items, or if items cannot be converted to the dtype of the definition.
         """
         if definition.parent is not None:
             return cls._from_np_with_parent_items(data, definition)
         if sum([s > 1 for s in data.shape]) > 1:
-            raise ValueError(
-                f"Dimension data for {definition.name} must have only one row or column."
+            raise FlodymDataError(
+                f"Dimension data for '{definition.name}' must have only one row or column, but "
+                f"have {data.shape[0]} rows and {data.shape[1]} columns."
             )
         if data.ndim != 1:
             data = data.flatten()
         # delete header for items if present
-        if data[0] == definition.name:
+        if data.size > 0 and data[0] == definition.name:
             data = data[1:]
-        data = [definition.dtype(item) for item in data]
+        items = _convert_items(data, definition)
         return cls(
-            name=definition.name, letter=definition.letter, items=data, dtype=definition.dtype
+            name=definition.name, letter=definition.letter, items=items, dtype=definition.dtype
         )
 
     @classmethod
@@ -211,13 +237,14 @@ class Dimension(FlodymBaseModel):
             ValueError: If the array does not have two columns.
         """
         if data.ndim != 2 or data.shape[1] != 2:
-            raise ValueError(
-                f"Dimension data for {definition.name} must have two columns: the items, and the "
-                f"items of the parent dimension '{definition.parent}' they belong to."
+            raise FlodymDataError(
+                f"Dimension data for '{definition.name}' must have two columns: the items, and "
+                f"the items of the parent dimension '{definition.parent}' they belong to. Given "
+                f"data have shape {data.shape}."
             )
-        if data[0, 0] == definition.name:
+        if data.shape[0] > 0 and data[0, 0] == definition.name:
             data = data[1:]
-        items = [definition.dtype(item) for item in data[:, 0]]
+        items = _convert_items(data[:, 0], definition)
         parent_items = data[:, 1].tolist()
         return cls(
             name=definition.name,
@@ -621,7 +648,7 @@ class DimensionSet(FlodymBaseModel):
         if isinstance(key, tuple):
             return self.get_subset(key)
         if isinstance(key, str):
-            return self._full_mapping[key]
+            return self._get_dim(key)
         elif isinstance(key, int):
             return self.dim_list[key]
         else:
@@ -694,6 +721,21 @@ class DimensionSet(FlodymBaseModel):
         """
         return {dim.name: dim for dim in self.dim_list} | {dim.letter: dim for dim in self.dim_list}
 
+    def _get_dim(self, key: str) -> Dimension:
+        """Get a dimension by its name or letter.
+
+        Raises:
+            KeyError: If there is no such dimension, with the dimensions of the set.
+        """
+        try:
+            return self._full_mapping[key]
+        except KeyError:
+            dims = ", ".join(f"'{dim.name}' ({dim.letter})" for dim in self.dim_list) or "none"
+            raise _DimensionNotFoundError(
+                f"No dimension with name or letter {key!r}.{did_you_mean(key, self._full_mapping)} "
+                f"Dimensions: {dims}."
+            ) from None
+
     def size(self, key: str) -> int:
         """Get the number of items in a dimension.
 
@@ -703,7 +745,7 @@ class DimensionSet(FlodymBaseModel):
         Returns:
             The number of items in the dimension.
         """
-        return self._full_mapping[key].len
+        return self._get_dim(key).len
 
     def index(self, key: str) -> int:
         """Return the index of a dimension in the set.
@@ -714,7 +756,7 @@ class DimensionSet(FlodymBaseModel):
         Returns:
             The position of the dimension in the set.
         """
-        dim = self._full_mapping[key]
+        dim = self._get_dim(key)
         return self.dim_list.index(dim)
 
     def copy(self) -> DimensionSet:
@@ -736,7 +778,7 @@ class DimensionSet(FlodymBaseModel):
         """
         subset = self.model_copy()
         if dims is not None:
-            subset.dim_list = [self._full_mapping[dim_key] for dim_key in dims]
+            subset.dim_list = [self._get_dim(dim_key) for dim_key in dims]
         return subset
 
     @overload
@@ -883,7 +925,7 @@ class DimensionSet(FlodymBaseModel):
         Returns:
             None if inplace=True, otherwise a new DimensionSet with the dimension removed
         """
-        dim_to_drop = self._full_mapping[key]
+        dim_to_drop = self._get_dim(key)
         if inplace:
             self.dim_list.remove(dim_to_drop)
             return
@@ -1019,3 +1061,40 @@ class DimensionSet(FlodymBaseModel):
                 "New dimension can't have same letter as any of those already in DimensionSet, "
                 "as that would create ambiguity."
             )
+
+
+def _convert_items(data: np.ndarray, definition: DimensionDefinition) -> list[Any]:
+    """Convert read items to the dtype of a dimension definition.
+
+    Raises:
+        FlodymDataError: If there are no items, if items are empty, or if they cannot be
+            converted.
+    """
+    if data.size == 0:
+        raise FlodymDataError(f"No items found for dimension '{definition.name}'.")
+    positions = [position for position, item in enumerate(data) if pd.isna(item)]
+    if positions:
+        raise FlodymDataError(
+            f"Dimension data for '{definition.name}' have empty cells (at positions "
+            f"{list_values(positions)}, counting from 0 after a header). Remove them."
+        )
+    items = []
+    failed = []
+    for item in data:
+        try:
+            items.append(definition.dtype(item))
+        except (ValueError, TypeError):
+            failed.append(item)
+    if failed:
+        header_hint = ""
+        if isinstance(data[0], str) and data[0] in failed:
+            header_hint = (
+                f" If {data[0]!r} is a header, it must be the dimension name "
+                f"'{definition.name}'.{did_you_mean(data[0], [definition.name])}"
+            )
+        raise FlodymDataError(
+            f"Items of dimension '{definition.name}' cannot be converted to the type "
+            f"{definition.dtype.__name__} given in its definition: {list_values(failed)}."
+            + header_hint
+        )
+    return items

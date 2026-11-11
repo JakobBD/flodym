@@ -56,6 +56,32 @@ objects instead.
   ``except flodym.FlodymValidationError`` or ``except ValueError``. The original pydantic error
   is available as the attribute ``pydantic_error``, and ``errors()`` returns the details of each
   problem as ``pydantic.ValidationError.errors()`` does.
+- **Invalid data** read by the data readers or by ``FlodymArray.from_df()`` and
+  ``set_values_from_df()`` raise ``flodym.FlodymDataError``, a subclass of ``ValueError``. Its
+  message names the parameter, its dimensions and the file and sheet, and describes the problem,
+  e.g. items not in a dimension with the index of their rows. In v1, these errors kept the type
+  of the error that occurred, e.g. ``KeyError`` or ``IndexError``. A missing entry in
+  ``parameter_files``, ``parameter_sheets``, ``dimension_files`` or ``dimension_sheets`` of the
+  readers also raises ``FlodymDataError`` instead of ``KeyError``.
+
+  *Action:* Replace ``except KeyError`` or ``except IndexError`` around reading data by
+  ``except flodym.FlodymDataError`` or ``except ValueError``.
+- **Dimension columns must be named** by dimension name or letter in ``FlodymArray.from_df()``,
+  ``set_values_from_df()`` and the parameter readers. v1 also recognized columns by their items,
+  took the first row as items if it contained items instead of names, and treated an unnamed
+  index with labels between 1700 and 2300 as years. The layout now follows from the column
+  names alone: long format if there is a column ``value`` or every dimension has a column; wide
+  format if exactly one dimension has no column and column names are items of it. An unnamed
+  index is no longer read; name it, or use ``reset_index()``.
+
+  *Action:* Write the dimension name or letter into the header cell of each dimension column,
+  e.g. ``Region`` or ``r``. Files without header row need one. The error message names the
+  columns that hold the items of a dimension without column.
+- **Duplicate items** of a ``Dimension`` raise a ``FlodymValidationError``. In v1, they were
+  accepted, although values for such items cannot be told apart.
+- **Asserts** on arguments of ``cast_to()``, ``get_shares_over()``, math operations of
+  ``FlodymArray`` and of the array plotter were replaced by exceptions. They now raise
+  ``ValueError`` or ``TypeError`` instead of ``AssertionError``, also under ``python -O``.
 - **Attributes of** ``MFASystem`` **subclasses** must be declared as fields, e.g.
   ``cfg: MyConfig`` in the class body. In v1, ``MFASystem`` accepted undeclared keyword
   arguments and attributes. The same applies to the array and process graph plotters.
@@ -362,3 +388,7 @@ New features
   it to a ``StockArray``.
 - **Attribute access:** ``mfa.flows.my_flow`` in addition to ``mfa.flows["my_flow"]``, also for
   stocks, processes and parameters (``flodym.AttributeDict``).
+- **Further columns in data:** ``FlodymArray.from_df()`` and the data readers ignore columns
+  that are not needed, e.g. units or comments: in long format, all columns besides the
+  dimension columns and the value column ``value``; in wide format, columns which contain no
+  numbers. Such data raised an error in v1. The ignored columns are logged at level ``INFO``.
