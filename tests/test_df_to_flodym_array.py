@@ -102,47 +102,93 @@ def test_long_format_ignores_further_columns_if_unambiguous(caplog):
     assert "'comment', 'unit', 'age'" in caplog.text
 
 
-def test_long_format_further_columns_without_dimension_names():
+def test_long_format_value_column():
+    # the only further column is the value column, whatever its name
+    data = {"Region": LONG["Region"], "Time": LONG["Time"], "amount": LONG["value"]}
+    assert np.array_equal(from_df(data).values, EXPECTED)
+    # a column without header (e.g. the index written by to_csv) is not taken as value column
+    data["Unnamed: 0"] = [0, 1, 2, 3]
+    assert np.array_equal(from_df(data).values, EXPECTED)
+    with pytest.raises(fd.FlodymDataError, match="several further columns.*Name the value column"):
+        from_df({**data, "unit": ["t"] * 4})
+
+
+def test_dimension_columns_must_be_named():
     data = {"a": LONG["Region"], "b": LONG["Time"], "unit": ["t"] * 4, "value": LONG["value"]}
     with pytest.raises(fd.FlodymDataError) as error:
         from_df(data)
     message = str(error.value)
-    found = "Columns found for dimensions: 'a' for 'Region' (by items), 'b' for 'Time' (by items)."
-    assert found in message
-    assert "Other columns: 'unit', 'value'." in message
-    assert "Tip: name the dimension columns" in message
+    assert "Long format assumed, as there is a column 'value'." in message
+    assert "No column for dimension(s) 'Region' (r), 'Time' (t)." in message
+    assert "- Column 'a' holds items of 'Region'. Name it 'Region' or 'r'." in message
+    assert "- Column 'b' holds items of 'Time'. Name it 'Time' or 't'." in message
 
 
-def test_wide_format_ignores_text_columns_right_of_values(caplog):
-    wide = {"Region": ["Germany", "France"], 2020: [1.0, 2.0], 2021: [3.0, 4.0]}
+def test_wide_format_ignores_columns_without_numbers(caplog):
+    wide = {"Region": ["Germany", "France"], "unit": ["t", "t"], 2020: [1.0, 2.0], 2021: [3, 4]}
     with caplog.at_level(logging.INFO, logger="flodym"):
-        result = from_df({**wide, "unit": ["t", "t"], "empty": [None, None]})
+        result = from_df({**wide, "comment": ["x", None], "Unnamed: 5": [0, 1]})
     assert np.array_equal(result.values, EXPECTED)
-    assert "Ignoring columns right of the value columns of 'p': 'unit', 'empty'" in caplog.text
+    assert "Ignoring columns of 'p' which are neither dimension nor value columns: 'unit', " in (
+        caplog.text
+    )
 
 
-def test_wide_format_numeric_columns_right_of_values():
+def test_wide_format_numeric_columns_that_are_not_items():
     wide = {"Region": ["Germany", "France"], 2020: [1.0, 2.0], 2021: [3.0, 4.0], 2022: [5, 6]}
-    with pytest.raises(fd.FlodymDataError, match="right of them contain numbers: 2022"):
-        from_df(wide)
-    assert np.array_equal(from_df(wide, allow_extra_values=True).values, EXPECTED)
-
-
-def test_wide_format_hints():
-    with pytest.raises(fd.FlodymDataError, match="Items without column: 2021"):
-        from_df({"Region": ["Germany", "France"], 2020: [1.0, 2.0], 2022: [3.0, 4.0]})
-    with pytest.raises(fd.FlodymDataError, match="Further columns left of them: 'unit'"):
-        from_df({"Region": ["Germany", "France"], "unit": ["t", "t"], 2020: [1, 2], 2021: [3, 4]})
-
-
-def test_column_hints():
-    data = {"unit": ["t"] * 4, "Regoin": LONG["Region"], "Time": LONG["Time"], "value": [1] * 4}
-    with pytest.raises(fd.FlodymDataError, match="'Regoin' is not named .* Did you mean 'Region'"):
-        from_df(data)
-    data = {"a": ["Germany", "Frnace"] * 2, "b": LONG["Time"], "value": LONG["value"]}
     with pytest.raises(fd.FlodymDataError) as error:
-        from_df(data)
+        from_df(wide)
     message = str(error.value)
-    assert "Column 'a' could be dimension 'Region'" in message
-    assert "'Frnace' (index 1, 3; did you mean 'France'?)" in message
-    assert "Column 'b' has the items of dimension 'Time', but is right of a column" in message
+    assert "Wide format over 'Time' assumed, as there is no column 'value'" in message
+    assert "but their names are not items of 'Time': 2022." in message
+    assert np.array_equal(from_df(wide, allow_extra_values=True).values, EXPECTED)
+    with pytest.raises(fd.FlodymDataError, match="header '2020' seems to occur twice"):
+        from_df({"Region": ["Germany", "France"], "2020": [1, 2], "2021": [3, 4], "2020.1": [5, 6]})
+
+
+def test_wide_format_items_without_column():
+    wide = {"Region": ["Germany", "France"], 2020: [1.0, 2.0]}
+    with pytest.raises(fd.FlodymDataError, match="Items of 'Time' without column: 2021"):
+        from_df(wide)
+    result = from_df(wide, allow_missing_values=True)
+    assert np.array_equal(result.values, [[1.0, 0.0], [2.0, 0.0]])
+
+
+def test_misspelled_dimension_column_is_not_read_as_wide_format():
+    data = {"Regoin": LONG["Region"], "Time": LONG["Time"], "amount": LONG["value"]}
+    with pytest.raises(fd.FlodymDataError) as error:
+        from_df({**data, "Regoin": ["Germany", "Frnace"] * 2})
+    message = str(error.value)
+    assert "No column for dimension(s) 'Region' (r)." in message
+    assert "Column 'Regoin' is not named like a dimension. Did you mean 'Region'?" in message
+
+
+def test_header_hints():
+    with pytest.raises(fd.FlodymDataError, match="the data have no header row"):
+        from_df({0: LONG["Region"], 1: LONG["Time"], 2: LONG["value"]})
+    # the first data row was read as header
+    data = {
+        "Germany": ["France", "Germany", "France"],
+        "2020": [2020, 2021, 2021],
+        "1.0": [2, 3, 4],
+    }
+    with pytest.raises(fd.FlodymDataError, match="The first row seems to be data, not a header"):
+        from_df(data)
+    data = {"Unnamed: 0": ["Germany", "France"], "Unnamed: 1": [1, 2], "Title": [None, None]}
+    with pytest.raises(fd.FlodymDataError, match="Most columns have no header"):
+        from_df(data)
+    indexed = pd.DataFrame({"Time": LONG["Time"], "value": LONG["value"]}, index=LONG["Region"])
+    with pytest.raises(fd.FlodymDataError, match="The index holds items of 'Region'"):
+        fd.Parameter.from_df(dims=DIMS, df=indexed)
+    indexed = pd.DataFrame(LONG).set_index(["Region", "Time"])
+    assert np.array_equal(fd.Parameter.from_df(dims=DIMS, df=indexed).values, EXPECTED)
+
+
+@pytest.mark.parametrize("field", ["2.5", 2.5])
+def test_single_field_is_value_of_array_with_single_value(field):
+    single = fd.Dimension(name="Scenario", letter="s", items=["base"])
+    for dims in [fd.DimensionSet.empty(), fd.DimensionSet(dim_list=[single])]:
+        df = pd.DataFrame(columns=[field])
+        assert fd.Parameter.from_df(dims=dims, df=df).values.flatten().tolist() == [2.5]
+    with pytest.raises(fd.FlodymDataError, match="no rows"):
+        fd.Parameter.from_df(dims=fd.DimensionSet.empty(), df=pd.DataFrame(columns=["value"]))

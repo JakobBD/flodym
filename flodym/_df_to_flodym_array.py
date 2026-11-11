@@ -1,22 +1,36 @@
-"""Conversion of pandas DataFrames to values of FlodymArrays (private module)."""
+"""Conversion of pandas DataFrames to values of FlodymArrays (private module).
+
+The layout of the DataFrame follows from its column names, without looking at the entries:
+
+- Dimension columns are named by dimension name or letter. Dimensions with one item need no
+  column.
+- Long format: there is a column ``value``, or every dimension has a column. The value column is
+  ``value``, or else the only further column. Other columns are ignored.
+- Wide format: there is no column ``value``, exactly one dimension has no column, and some column
+  names are items of it. These columns hold the values. Further columns without numbers, e.g.
+  units or comments, are ignored.
+
+The entries are only used for the hints in error messages.
+"""
 
 import itertools
 import logging
+import re
 from collections.abc import Hashable, Iterable, Sequence
-from typing import TYPE_CHECKING, Any, Literal
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import pandas as pd
 
 from ._base_model import (
     MAX_LISTED_VALUES,
-    FlodymBaseModel,
     FlodymDataError,
     closest_name,
     list_values,
     to_builtin,
 )
-from .dimensions import Dimension
+from .dimensions import Dimension, DimensionSet
 
 if TYPE_CHECKING:
     from .flodym_arrays import FlodymArray
@@ -26,41 +40,46 @@ logger = logging.getLogger(__name__)
 MAX_LISTED_COMBINATIONS = 10
 """Maximum number of missing index combinations listed in an error message."""
 
-MIN_SHARE_OF_DIM_ITEMS = 0.5
-"""A column is described as a possible dimension column in error messages if at least this
-share of its items are items of the dimension."""
-
-DEFAULT_VALUE_COLUMN = "value"
-"""Name of the value column which allows further columns in long format to be ignored."""
+VALUE_COLUMN = "value"
+"""Name of the value column. A column of this name means long format."""
 
 NOT_AN_ITEM = object()
-"""Returned by :py:meth:`DataFrameToFlodymDataConverter._as_item` for values which are not an
-item of the dimension."""
+"""Returned by :py:func:`as_item` for values which are not an item of the dimension."""
+
+UNNAMED_COLUMN = re.compile(r"^Unnamed: \d+$")
+"""Name pandas gives to columns with an empty header cell."""
+
+RENAMED_DUPLICATE = re.compile(r"^(.+)\.\d+$")
+"""Name pandas gives to the second and further columns with the same header, e.g. ``2020.1``."""
 
 
-class FlodymDataFormat(FlodymBaseModel):
-    """Format of a DataFrame holding the values of a FlodymArray."""
+@dataclass
+class DataLayout:
+    """How the columns of a DataFrame are mapped to the dimensions and values of an array."""
 
-    type: Literal["long", "wide"]
-    """Long format: one column per dimension and one value column; wide format: the items of one
-    dimension are spread over the value columns."""
-    value_column: Hashable = DEFAULT_VALUE_COLUMN
-    """Name of the value column (long format)."""
-    columns_dim: str | None = None
-    """Name of the dimension whose items are the value column names (wide format)."""
+    dim_columns: dict[str, Hashable]
+    """Column of each dimension that has one, by dimension name."""
+    reason: str
+    """Why this layout was chosen, for error messages."""
+    value_column: Hashable | None = None
+    """Long format: the column with the values."""
+    wide_dim: Dimension | None = None
+    """Wide format: the dimension whose items name the value columns."""
+    item_columns: dict[Hashable, Any] = field(default_factory=dict)
+    """Wide format: the item of :py:attr:`wide_dim` for each value column."""
+    ignored_columns: list[Hashable] = field(default_factory=list)
+    """Columns which are neither dimension nor value columns."""
 
 
 class DataFrameToFlodymDataConverter:
     """Converts a pandas DataFrame to a numpy array that can be used as values of a FlodymArray.
 
-    Various DataFrame formats are possible.
-
     Usually not called by the user, but from within the FlodymArray from_df and
-    set_values_from_df methods, where further documentation can be found.
+    set_values_from_df methods, where further documentation can be found. The layout rule is
+    described in the docstring of this module.
 
     Problems with the data raise a :py:class:`flodym.FlodymDataError`. Where single entries are
-    the problem, the message gives their labels in the index of the DataFrame. In case of
-    errors, turning on debug logging might help to understand the process.
+    the problem, the message gives their labels in the index of the DataFrame.
     """
 
     def __init__(
@@ -73,14 +92,10 @@ class DataFrameToFlodymDataConverter:
     ) -> None:
         self.df = df.copy()
         self.flodym_array = flodym_array
+        self.dims: DimensionSet = flodym_array.dims
         self.allow_missing_values = allow_missing_values
         self.allow_extra_values = allow_extra_values
         self.strip_whitespace = strip_whitespace
-        self.dim_columns: list[str] = []
-        self.found_by: dict[str, str] = {}
-        """How the column of each dimension was found: by "name", "letter" or "items"."""
-        self.original_columns: dict[str, Hashable] = {}
-        """Name of the column of each dimension in the given DataFrame, before renaming."""
         try:
             self.target_values = self._get_target_values()
         except FlodymDataError as error:
@@ -95,8 +110,7 @@ class DataFrameToFlodymDataConverter:
     def _error_context(self) -> str:
         """First line of error messages, naming the FlodymArray whose values are set."""
         array_type = type(self.flodym_array).__name__
-        dims = self.flodym_array.dims
-        dims_text = ", ".join(f"{dim.name} ({dim.letter})" for dim in dims) or "no dimensions"
+        dims_text = ", ".join(f"{dim.name} ({dim.letter})" for dim in self.dims) or "no dimensions"
         name = self.flodym_array.name
         if name in (None, "unnamed"):
             return (
@@ -109,57 +123,37 @@ class DataFrameToFlodymDataConverter:
         )
 
     def _get_target_values(self) -> np.ndarray:
-        """Determine the DataFrame format and convert it to an array of the FlodymArray's shape.
+        """Convert the DataFrame to an array of the FlodymArray's shape.
 
         Returns:
             The values for the FlodymArray.
         """
-        logger.debug(
-            f"Start setting values for FlodymArray {self.flodym_array.name} with dimensions "
-            f"{self.flodym_array.dims.names} from dataframe."
-        )
-        self._reset_non_default_index()
+        self._move_named_index_to_columns()
         if self.strip_whitespace:
             self._strip_whitespace_from_df()
         self._drop_empty_rows_and_columns()
-        self._determine_format()
-        self._df_to_long_format()
-        self._check_missing_dim_columns()
+        if not self._read_single_field():
+            layout = determine_layout(
+                self.df, self.dims, self.allow_extra_values, self.allow_missing_values
+            )
+            if layout.ignored_columns:
+                logger.info(
+                    f"Ignoring columns of '{self.flodym_array.name}' which are neither "
+                    f"dimension nor value columns: {list_values(layout.ignored_columns)}"
+                )
+            self.df = to_long_format(self.df, layout)
+        self._add_single_item_dims()
         self._check_empty_dim_cells()
         self._convert_type()
-        self._sort_columns()
-        values = self._check_data_complete()
-        return values
+        self.df = self.df[list(self.dims.names) + [VALUE_COLUMN]]
+        return self._check_data_complete()
 
-    @staticmethod
-    def same_items(arr: Iterable[Any], dim: Dimension) -> bool:
-        """Check if the items in ``arr`` are exactly the items of ``dim``.
+    def _move_named_index_to_columns(self) -> None:
+        """Make index levels with a name columns, e.g. after ``read_csv(..., index_col=[0, 1])``.
 
-        Items of ``arr`` are converted to the dimension dtype, if given. Order and repetitions are
-        disregarded.
+        An unnamed index is kept, as error messages use its labels to name rows.
         """
-        dim_items = set(dim.items)
-        found_items = set()
-        for item in arr:
-            if dim.dtype is not None:
-                try:
-                    item = dim.dtype(item)
-                except (ValueError, TypeError):
-                    return False
-            # Exit at the first non-matching item without scanning and converting all entries
-            if item not in dim_items:
-                return False
-            found_items.add(item)
-        return len(found_items) == len(dim_items)
-
-    def _reset_non_default_index(self) -> None:
-        if (
-            isinstance(self.df.index, pd.MultiIndex)
-            or self.df.index.name is not None
-            or self.df.index.dtype != np.int64
-            or self.df.index.min() >= 1700
-            and self.df.index.max() <= 2300
-        ):
+        if any(name is not None for name in self.df.index.names):
             self.df.reset_index(inplace=True)
 
     def _strip_whitespace_from_df(self) -> None:
@@ -186,15 +180,12 @@ class DataFrameToFlodymDataConverter:
     def _drop_empty_rows_and_columns(self) -> None:
         """Drop rows without any entry, and columns without entries and without a name.
 
-        Such rows and columns occur e.g. in Excel sheets with formatted but empty cells. Columns
-        without a name are named ``"Unnamed: <position>"`` by pandas.
+        Such rows and columns occur e.g. in Excel sheets with formatted but empty cells.
         """
         empty_columns = [
             column
             for column in self.df.columns
-            if isinstance(column, str)
-            and column.startswith("Unnamed: ")
-            and self.df[column].isna().all()
+            if is_unnamed(column) and self.df[column].isna().all()
         ]
         if empty_columns:
             logger.debug(f"Dropping empty columns without name: {empty_columns}")
@@ -205,387 +196,29 @@ class DataFrameToFlodymDataConverter:
                 "The DataFrame has no columns. Check that the file or sheet contains the data."
             )
 
-    def _determine_format(self) -> None:
-        self._get_dim_columns_by_name_or_letter()
-        self._check_if_first_row_are_items()
-        self._check_for_dim_columns_by_items()
-        self._check_value_columns()
+    def _read_single_field(self) -> bool:
+        """Read the value of an array with a single value from a file with a single field.
 
-    def _get_dim_columns_by_name_or_letter(self) -> None:
-        dims = self.flodym_array.dims
-        self.original_dim_columns = [c for c in self.df.columns if c in dims]
-        for c in self.df.columns:
-            if c in dims.names:
-                self.found_by[c] = "name"
-            elif c in dims.letters:
-                self.df.rename(columns={c: dims[c].name}, inplace=True)
-                self.found_by[dims[c].name] = "letter"
-                self.original_columns[dims[c].name] = c
-                logger.debug(f"Renamed column {c} to dimension name {dims[c].name}")
-        self.dim_columns = [c for c in self.df.columns if c in dims.names]
-        logger.debug(f"Recognized index columns by name: {self.dim_columns}")
-
-    def _check_if_first_row_are_items(self) -> None:
-        """Restore the first row of the data if it was erroneously read as column names.
-
-        If data without columns names was read, but the first row was assumed to be column names,
-        the first row of the data frame might erroneously end up as column names.
-        This method checks if that is the case, and if so, prepends a row based on column names.
-        """
-        column_name = self.df.columns[0]
-        col_items = self.df[column_name].unique()
-        extended_col_items = [column_name] + col_items.tolist()
-        for dim in self.flodym_array.dims:
-            if self.same_items(extended_col_items, dim):
-                self._add_column_names_as_row(column_name, dim)
-                return
-
-    def _add_column_names_as_row(self, column_name: Hashable, dim: Dimension) -> None:
-        if len(self.dim_columns) > 0:
-            raise FlodymDataError(
-                f"Ambiguity detected: column with first item {column_name!r} could be "
-                f"dimension '{dim.name}' if the first row counts as an item, but columns "
-                f"{self.original_dim_columns} are already recognized as dimensions by their "
-                "name. Please add dimension names to your index columns, change the item names "
-                "of the affected dimension, or use a different method to read data."
-            )
-        # prepend a row with the column names; its index label comes before all others
-        first_label = self.df.index.min() - 1 if len(self.df) > 0 else 0
-        header_row = pd.DataFrame([list(self.df.columns)], columns=self.df.columns)
-        header_row.index = [first_label]
-        self.df = pd.concat([header_row, self.df])
-        self.df.columns = [f"column {i}" for i in range(len(self.df.columns))]
-
-    def _check_for_dim_columns_by_items(self) -> None:
-        for cn in self.df.columns:
-            if cn in self.dim_columns:
-                continue
-            found = self._check_if_dim_column_by_items(cn)
-            if not found:
-                logger.debug(
-                    f"Could not find dimension with same items as column {cn}. "
-                    "Assuming this is the first value column; Won't look further."
-                )
-                return
-
-    def _check_if_dim_column_by_items(self, column_name: Hashable) -> bool:
-        logger.debug(f"Checking if {column_name} is a dimension by comparing items with dim items")
-        col_items = self.df[column_name].unique()
-        for dim in self.flodym_array.dims:
-            if dim.name in self.dim_columns:
-                continue
-            if self.same_items(col_items, dim):
-                logger.debug(f"{column_name} is dimension {dim.name}.")
-                self.df.rename(columns={column_name: dim.name}, inplace=True)
-                self.dim_columns.append(dim.name)
-                self.found_by[dim.name] = "items"
-                self.original_columns[dim.name] = column_name
-                return True
-        return False
-
-    def _check_value_columns(self) -> None:
-        value_columns = [c for c in self.df.columns if c not in self.dim_columns]
-        logger.debug(f"Assumed value columns: {value_columns}")
-        if not value_columns:
-            raise FlodymDataError(
-                f"No value column found: all columns ({list_values(self.df.columns)}) were found "
-                "to be dimension columns."
-            )
-        if not self._check_if_value_columns_match_dim_items(value_columns):
-            self._check_if_valid_long_format(value_columns)
-
-    def _check_if_value_columns_match_dim_items(self, value_columns: list[Hashable]) -> bool:
-        """Check for wide format: the first value columns are named by the items of a dimension.
-
-        Further columns to their right are dropped if they contain no numbers, e.g. units or
-        comments. If extra values are allowed, they are dropped in any case.
+        pandas reads such a file with the field as column name and no rows. This is only done if
+        all dimensions have one item, as then exactly one number is needed.
 
         Returns:
-            Whether the data are in wide format.
+            Whether the value was read.
         """
-        logger.debug("Trying to match set of value column names with items of dimension.")
-        for dim in self.flodym_array.dims:
-            if dim.name in self.dim_columns:
-                continue
-            n_item_columns = 0
-            for column in value_columns:
-                if self._as_item(column, dim) is NOT_AN_ITEM:
-                    break
-                n_item_columns += 1
-            item_columns = value_columns[:n_item_columns]
-            if not item_columns or not self.same_items(item_columns, dim):
-                continue
-            logger.debug(f"Value columns match dimension items of {dim.name}.")
-            self._drop_columns_right_of_values(value_columns[n_item_columns:], dim)
-            self.format = FlodymDataFormat(type="wide", columns_dim=dim.name)
-            if dim.dtype is not None:
-                self.df.rename(columns={c: dim.dtype(c) for c in item_columns}, inplace=True)
-            return True
-        return False
+        if any(dim.len > 1 for dim in self.dims) or len(self.df) > 0 or len(self.df.columns) > 1:
+            return False
+        try:
+            value = float(self.df.columns[0])
+        except (TypeError, ValueError):
+            return False
+        self.df = pd.DataFrame({VALUE_COLUMN: [value]})
+        return True
 
-    def _drop_columns_right_of_values(self, columns: list[Hashable], dim: Dimension) -> None:
-        """Drop columns right of the value columns of the wide format, if they hold no values.
-
-        Raises:
-            FlodymDataError: If one of the columns contains numbers, and extra values are not
-                allowed.
-        """
-        if not columns:
-            return
-        if not self.allow_extra_values:
-            numeric_columns = [c for c in columns if self._contains_numbers(c)]
-            if numeric_columns:
-                raise FlodymDataError(
-                    f"The value columns are named by the items of dimension '{dim.name}', but "
-                    "further columns right of them contain numbers: "
-                    f"{list_values(numeric_columns)}.\n"
-                    f"If these are values for items that are not in dimension '{dim.name}', set "
-                    "allow_extra_values=True to ignore them. Otherwise, remove these columns. "
-                    "Columns right of the value columns are ignored only if they contain no "
-                    "numbers, e.g. units or comments."
-                )
-        logger.info(
-            f"Ignoring columns right of the value columns of '{self.flodym_array.name}': "
-            f"{list_values(columns)}"
-        )
-        self.df = self.df.drop(columns=columns)
-
-    def _contains_numbers(self, column: Hashable) -> bool:
-        """Whether any entry of a column is a number or a string that can be read as a number."""
-        entries = self.df[column].dropna()
-        return bool(pd.to_numeric(entries, errors="coerce").notna().any())
-
-    def _check_if_valid_long_format(self, value_columns: list[Hashable]) -> None:
-        """Check for long format: one value column, or a column named "value".
-
-        Further columns are dropped if the value column is named "value" and all dimension
-        columns were found by their name or letter, as then no column can be mistaken for another.
-
-        Raises:
-            FlodymDataError: If the value column cannot be determined.
-        """
-        logger.debug(
-            "Could not find dimension with same item set as value column names. Assuming long "
-            "format, i.e. one value column."
-        )
-        if len(value_columns) == 1:
-            self.format = FlodymDataFormat(type="long", value_column=value_columns[0])
-            logger.debug(f"Value column name is {value_columns[0]}.")
-            return
-        if DEFAULT_VALUE_COLUMN in value_columns and self._dims_found_by_label():
-            ignored = [c for c in value_columns if c != DEFAULT_VALUE_COLUMN]
-            logger.info(
-                f"Ignoring columns of '{self.flodym_array.name}' which are neither dimension "
-                f"columns nor the value column '{DEFAULT_VALUE_COLUMN}': {list_values(ignored)}"
-            )
-            self.df = self.df.drop(columns=ignored)
-            self.format = FlodymDataFormat(type="long", value_column=DEFAULT_VALUE_COLUMN)
-            return
-        raise FlodymDataError(self._format_problem(value_columns))
-
-    def _dims_found_by_label(self) -> bool:
-        """Whether all dimensions with more than one item were found by their name or letter."""
-        return all(
-            self.found_by.get(dim.name) in ("name", "letter")
-            for dim in self.flodym_array.dims
-            if dim.len > 1
-        )
-
-    def _format_problem(self, value_columns: list[Hashable]) -> str:
-        """Explain why the format could not be determined, with the closest matches found."""
-        lines = ["Could not determine which column(s) hold the values."]
-        if self.dim_columns:
-            found = [
-                f"{self.original_columns.get(c, c)!r} for '{c}' (by {self.found_by.get(c, 'items')})"
-                for c in self.dim_columns
-            ]
-            lines.append(f"Columns found for dimensions: {', '.join(found)}.")
-        else:
-            lines.append("No column was found for any dimension.")
-        lines.append(f"Other columns: {list_values(value_columns)}.")
-        missing_dims = [
-            dim
-            for dim in self.flodym_array.dims
-            if dim.name not in self.dim_columns and dim.len > 1
-        ]
-        explained_dims: set[str] = set()
-        wide_dims: set[str] = set()
-        for dim in missing_dims:
-            wide_hint = self._wide_format_hint(value_columns, dim)
-            if wide_hint:
-                lines.append(wide_hint)
-                explained_dims.add(dim.name)
-                wide_dims.add(dim.name)
-        for column in value_columns:
-            column_hint = self._column_hint(column, missing_dims)
-            if column_hint is not None:
-                lines.append(column_hint[1])
-                explained_dims.add(column_hint[0])
-        for dim in missing_dims:
-            if dim.name not in explained_dims:
-                lines.append(
-                    f"- No column matches dimension '{dim.name}' ({dim.letter}), with items "
-                    f"{list_values(dim.items)}."
-                )
-        lines.append(
-            "Expected are either one column for each dimension and one value column (long "
-            "format), or one column for each dimension but one, and one value column for each "
-            "item of that dimension (wide format)."
-        )
-        if DEFAULT_VALUE_COLUMN in value_columns:
-            lines.append(
-                f"Further columns are ignored if the value column is named "
-                f"'{DEFAULT_VALUE_COLUMN}' and all dimension columns are named by dimension name "
-                "or letter."
-            )
-        lines += self._naming_hint(wide_dims)
-        return "\n".join(lines)
-
-    def _wide_format_hint(self, value_columns: list[Hashable], dim: Dimension) -> str:
-        """Describe how the column names differ from the items of a dimension, if they are close."""
-        item_columns = [c for c in value_columns if self._as_item(c, dim) is not NOT_AN_ITEM]
-        if not item_columns or len(item_columns) < len(value_columns) / 2:
-            return ""
-        lines = [
-            (
-                f"- The column names {list_values(item_columns)} are items of dimension "
-                f"'{dim.name}', as in wide format, but:"
-            ),
-        ]
-        items_with_column = {self._as_item(c, dim) for c in item_columns}
-        missing_items = [item for item in dim.items if item not in items_with_column]
-        if missing_items:
-            lines.append(f"  - Items without column: {list_values(missing_items)}.")
-        first = value_columns.index(item_columns[0])
-        last = value_columns.index(item_columns[-1])
-        before = value_columns[:first]
-        if before:
-            lines.append(
-                f"  - Further columns left of them: {list_values(before)}. Further columns are "
-                "only allowed right of the value columns."
-            )
-        between = [c for c in value_columns[first:last] if c not in item_columns]
-        if between:
-            lines.append(f"  - Further columns between them: {list_values(between)}.")
-        numeric_after = [c for c in value_columns[last + 1 :] if self._contains_numbers(c)]
-        if numeric_after and not self.allow_extra_values:
-            lines.append(
-                f"  - Further columns right of them contain numbers: {list_values(numeric_after)}. "
-                "They are only ignored if they contain no numbers, e.g. units or comments, or "
-                "if allow_extra_values=True."
-            )
-        return "\n".join(lines) if len(lines) > 1 else ""
-
-    def _column_hint(self, column: Hashable, dims: list[Dimension]) -> tuple[str, str] | None:
-        """Describe how the items of a column differ from those of the closest dimension.
-
-        Returns:
-            The name of the closest dimension and the description, or None if no dimension is
-            close.
-        """
-        dims_by_label = {dim.name: dim for dim in dims} | {dim.letter: dim for dim in dims}
-        meant_label = closest_name(column, dims_by_label)
-        if meant_label is not None:
-            return dims_by_label[meant_label].name, (
-                f"- Column {column!r} is not named like a dimension. Did you mean "
-                f"'{meant_label}'? Dimension columns must be named exactly by dimension name or "
-                "letter."
-            )
-        column_items = [item for item in self.df[column].unique() if not _is_missing(item)]
-        if not column_items or not dims:
-            return None
-
-        def share_in_dim(dim: Dimension) -> float:
-            dim_items = {str(item).strip() for item in dim.items}
-            return sum(str(item).strip() in dim_items for item in column_items) / len(column_items)
-
-        closest = max(dims, key=share_in_dim)
-        share = share_in_dim(closest)
-        if share < MIN_SHARE_OF_DIM_ITEMS:
-            return None
-        if self.same_items(column_items, closest):
-            return closest.name, (
-                f"- Column '{column}' has the items of dimension '{closest.name}', but is right of "
-                "a column which is not a dimension column. Columns without dimension name or "
-                "letter are found by their items only from the left, up to the first column which "
-                "is not a dimension column."
-            )
-        lines = [
-            (
-                f"- Column '{column}' could be dimension '{closest.name}' ({share:.0%} of its "
-                "items are items of the dimension), but:"
-            ),
-        ]
-        extra = [item for item in column_items if self._as_item(item, closest) is NOT_AN_ITEM]
-        if extra:
-            lines.append(
-                "  - Items not in the dimension: "
-                + self._entries_with_index(column, extra, suggestions=closest.items)
-                + "."
-            )
-            type_hint = _type_hint(extra, closest)
-            if type_hint:
-                lines.append(f"  - {type_hint}")
-        found = {self._as_item(item, closest) for item in column_items}
-        missing = [item for item in closest.items if item not in found]
-        if missing:
-            lines.append(f"  - Dimension items not in the column: {list_values(missing)}.")
-        return closest.name, "\n".join(lines)
-
-    def _naming_hint(self, wide_dims: set[str]) -> list[str]:
-        """Recommend naming the dimension columns, if they were not all found by name or letter.
-
-        Args:
-            wide_dims: Dimensions which are probably given by the value column names.
-        """
-        dims = [
-            dim
-            for dim in self.flodym_array.dims
-            if dim.len > 1
-            and dim.name not in wide_dims
-            and self.found_by.get(dim.name) not in ("name", "letter")
-        ]
-        if not dims:
-            return []
-        names = ", ".join(f"'{dim.name}' or '{dim.letter}'" for dim in dims)
-        return [
-            (
-                f"Tip: name the dimension columns by dimension name or letter ({names}). Then "
-                "they are found regardless of their items, and error messages are more precise."
-            ),
-        ]
-
-    def _df_to_long_format(self) -> None:
-        if self.format.type != "wide":
-            return
-        logger.debug("Converting wide format to long format.")
-        value_cols = self.flodym_array.dims[self.format.columns_dim].items
-        self.df = self.df.melt(
-            id_vars=[c for c in self.df.columns if c not in value_cols],
-            value_vars=value_cols,
-            var_name=self.format.columns_dim,
-            value_name=self.format.value_column,
-            ignore_index=False,  # keep the index labels to name rows in error messages
-        )
-        self.dim_columns.append(self.format.columns_dim)
-        self.format = FlodymDataFormat(type="long", value_column=self.format.value_column)
-
-    def _check_missing_dim_columns(self) -> None:
-        missing_dim_columns = [
-            dim.name for dim in self.flodym_array.dims if dim.name not in self.dim_columns
-        ]
-        for c in missing_dim_columns:
-            dim = self.flodym_array.dims[c]
-            if dim.len == 1:
-                self.df[c] = dim.items[0]
-                self.dim_columns.append(c)
-            else:
-                raise FlodymDataError(
-                    f"No column found for dimension '{dim.name}' ({dim.letter}), which has "
-                    f"{dim.len} items: {list_values(dim.items)}. Columns of the DataFrame: "
-                    f"{list_values(self.df.columns)}. Name the column of this dimension "
-                    f"'{dim.name}' or '{dim.letter}'."
-                )
+    def _add_single_item_dims(self) -> None:
+        """Add a column for each dimension with one item that has no column."""
+        for dim in self.dims:
+            if dim.name not in self.df.columns:
+                self.df[dim.name] = dim.items[0]
 
     def _check_empty_dim_cells(self) -> None:
         """Check for empty cells in dimension columns; drop their rows if extra values are allowed.
@@ -593,7 +226,7 @@ class DataFrameToFlodymDataConverter:
         Raises:
             FlodymDataError: If there are empty cells and extra values are not allowed.
         """
-        for dim in self.flodym_array.dims:
+        for dim in self.dims:
             empty = self.df[dim.name].isna()
             if not empty.any():
                 continue
@@ -611,7 +244,7 @@ class DataFrameToFlodymDataConverter:
         Raises:
             FlodymDataError: If an entry cannot be converted.
         """
-        for dim in self.flodym_array.dims:
+        for dim in self.dims:
             if dim.dtype is None:
                 continue
             converted: dict[Any, Any] = {}
@@ -628,88 +261,69 @@ class DataFrameToFlodymDataConverter:
                     f"{self._entries_with_index(dim.name, failed, suggestions=dim.items)}."
                 )
             self.df[dim.name] = self.df[dim.name].map(converted)
-        value_column = self.format.value_column
-        values = pd.to_numeric(self.df[value_column], errors="coerce")
-        not_numbers = values.isna() & self.df[value_column].notna()
+        values = pd.to_numeric(self.df[VALUE_COLUMN], errors="coerce")
+        not_numbers = values.isna() & self.df[VALUE_COLUMN].notna()
         if not_numbers.any():
-            entries = self.df.loc[not_numbers, value_column].unique().tolist()
+            entries = self.df.loc[not_numbers, VALUE_COLUMN].unique().tolist()
             raise FlodymDataError(
-                f"Value column '{value_column}' has entries that are not numbers: "
-                f"{self._entries_with_index(value_column, entries)}."
+                "The value column has entries that are not numbers: "
+                f"{self._entries_with_index(VALUE_COLUMN, entries)}."
             )
-        self.df[value_column] = values.astype(np.float64)
-
-    def _sort_columns(self) -> None:
-        """Sort the data frame columns according to the order of the FlodymArray dimensions."""
-        self.df = self.df[list(self.flodym_array.dims.names) + [self.format.value_column]]
+        self.df[VALUE_COLUMN] = values.astype(np.float64)
 
     def _check_data_complete(self) -> np.ndarray:
         # Special handling of the scalar case: If the FlodymArray has no dimensions, we usually
         # expect a single value in the df.
-        if self.flodym_array.dims.ndim == 0:
+        if self.dims.ndim == 0:
             if len(self.df) == 0:
                 if self.allow_missing_values:
                     return np.array(0.0)
                 raise FlodymDataError(
                     "FlodymArray has no dimensions, but the DataFrame has no rows. Expected "
-                    "exactly one row."
+                    "exactly one row, or a single field, which pandas reads as column name."
                 )
             if len(self.df) > 1:
                 raise FlodymDataError(
                     f"FlodymArray has no dimensions, but the DataFrame has {len(self.df)} rows. "
                     "Expected exactly one row."
                 )
-            return np.array(self.df[self.format.value_column].values[0])
+            return np.array(self.df[VALUE_COLUMN].values[0])
 
         self._check_no_duplicates()
 
         # remove rows with extra values or throw error
         if self.allow_extra_values:
-            for dim in self.flodym_array.dims:
+            for dim in self.dims:
                 self.df = self.df[self.df[dim.name].isin(dim.items)]
         else:
-            for dim in self.flodym_array.dims:
+            for dim in self.dims:
                 self._check_no_extra_items(dim)
 
         if self.allow_missing_values:
-            self.df[self.format.value_column] = self.df[self.format.value_column].fillna(0)
+            self.df[VALUE_COLUMN] = self.df[VALUE_COLUMN].fillna(0)
         else:
             # Duplicates throw an error, and extra values are removed above,
             # so unequal lengths indicate missing values
             if len(self.df) != self.flodym_array.size:
                 self._raise_missing_values()
-            empty = self.df[self.format.value_column].isna()
-            if empty.any():
-                dim_names = list(self.flodym_array.dims.names)
-                combinations = self.df.loc[empty, dim_names].itertuples(index=True, name=None)
-                listed = ", ".join(
-                    f"{_combination(tuple(combination[1:]))} (index {combination[0]!r})"
-                    for combination in itertools.islice(combinations, MAX_LISTED_VALUES)
-                )
-                n_empty = int(empty.sum())
-                more = f", ... ({n_empty} in total)" if n_empty > MAX_LISTED_VALUES else ""
-                raise FlodymDataError(
-                    f"Values are empty for these index combinations ({', '.join(dim_names)}): "
-                    f"{listed}{more}.\nFill them, or set allow_missing_values=True to set them to "
-                    "zero."
-                )
+            self._check_no_empty_values()
 
         # for performance and memory reasons, we use numpy operations to convert the data to the
         # numpy array
         # replace non-value items in df with their index in dims.items
-        for dim in self.flodym_array.dims:
+        for dim in self.dims:
             self.df[dim.name] = self.df[dim.name].map({item: i for i, item in enumerate(dim.items)})
         # convert df to numpy index array: Take all non-value columns
         fill_indices = self.df.values[:, :-1].T.astype(np.intp)
-        fill_values = self.df[self.format.value_column].values
+        fill_values = self.df[VALUE_COLUMN].values
         # this is what ends up in the parameter; initialize with zeros
-        values = np.zeros(self.flodym_array.dims.shape)
+        values = np.zeros(self.dims.shape)
         values[tuple(fill_indices)] = fill_values
         return values
 
     def _check_no_duplicates(self) -> None:
         """Raise an error if index combinations occur more than once."""
-        indices = self.df[list(self.flodym_array.dims.names)]
+        indices = self.df[list(self.dims.names)]
         duplicated = indices.duplicated(keep=False)
         if not duplicated.any():
             return
@@ -751,19 +365,37 @@ class DataFrameToFlodymDataConverter:
             f"allow_missing_values is set to False. Expected {self.flodym_array.size} "
             f"rows, but only got {len(self.df)}. Computing missing values...."
         )
-        indices = self.df[list(self.flodym_array.dims.names)]
+        indices = self.df[list(self.dims.names)]
         actual_index_tuples = set(indices.itertuples(index=False, name=None))
         missing = [
             combination
-            for combination in itertools.product(*[dim.items for dim in self.flodym_array.dims])
+            for combination in itertools.product(*[dim.items for dim in self.dims])
             if combination not in actual_index_tuples
         ]
         listed = ", ".join(_combination(c) for c in missing[:MAX_LISTED_COMBINATIONS])
         more = ", ..." if len(missing) > MAX_LISTED_COMBINATIONS else ""
         raise FlodymDataError(
             f"Values are missing for {len(missing)} of {self.flodym_array.size} index "
-            f"combinations ({', '.join(self.flodym_array.dims.names)}): {listed}{more}\n"
+            f"combinations ({', '.join(self.dims.names)}): {listed}{more}\n"
             "Add them, or set allow_missing_values=True to set them to zero."
+        )
+
+    def _check_no_empty_values(self) -> None:
+        """Raise an error if values are empty, naming their index combinations and rows."""
+        empty = self.df[VALUE_COLUMN].isna()
+        if not empty.any():
+            return
+        dim_names = list(self.dims.names)
+        combinations = self.df.loc[empty, dim_names].itertuples(index=True, name=None)
+        listed = ", ".join(
+            f"{_combination(tuple(combination[1:]))} (index {combination[0]!r})"
+            for combination in itertools.islice(combinations, MAX_LISTED_VALUES)
+        )
+        n_empty = int(empty.sum())
+        more = f", ... ({n_empty} in total)" if n_empty > MAX_LISTED_VALUES else ""
+        raise FlodymDataError(
+            f"Values are empty for these index combinations ({', '.join(dim_names)}): "
+            f"{listed}{more}.\nFill them, or set allow_missing_values=True to set them to zero."
         )
 
     def _entries_with_index(
@@ -785,21 +417,286 @@ class DataFrameToFlodymDataConverter:
         """List the index labels of the rows selected by ``mask``, each label once."""
         return list_values(dict.fromkeys(self.df.index[mask]))
 
-    @staticmethod
-    def _as_item(value: Any, dim: Dimension) -> Any:
-        """The item of ``dim`` that ``value`` stands for, or ``NOT_AN_ITEM``.
 
-        ``value`` is converted to the dtype of the dimension, if given.
-        """
-        if dim.dtype is not None:
-            try:
-                value = dim.dtype(value)
-            except (ValueError, TypeError):
-                return NOT_AN_ITEM
+def determine_layout(
+    df: pd.DataFrame,
+    dims: DimensionSet,
+    allow_extra_values: bool = False,
+    allow_missing_values: bool = False,
+) -> DataLayout:
+    """Determine the layout of a DataFrame from its column names, see the module docstring.
+
+    Raises:
+        FlodymDataError: If the column names do not give a valid layout.
+    """
+    dim_columns: dict[str, Hashable] = {}
+    for dim in dims:
+        columns = [c for c in df.columns if c in (dim.name, dim.letter)]
+        if len(columns) > 1:
+            raise FlodymDataError(
+                f"Dimension '{dim.name}' has several columns: {list_values(columns)}. Give one "
+                "column, named by dimension name or letter."
+            )
+        if columns:
+            dim_columns[dim.name] = columns[0]
+    other_columns = [c for c in df.columns if c not in dim_columns.values()]
+    dims_without_column = [dim for dim in dims if dim.len > 1 and dim.name not in dim_columns]
+
+    if VALUE_COLUMN in other_columns or not dims_without_column:
+        if VALUE_COLUMN in other_columns:
+            reason = f"Long format assumed, as there is a column '{VALUE_COLUMN}'."
+        else:
+            reason = "Long format assumed, as every dimension has a column."
+        if dims_without_column:
+            raise FlodymDataError(_layout_problem(df, dims_without_column, other_columns, reason))
+        return _long_layout(dim_columns, other_columns, reason)
+
+    if len(dims_without_column) == 1:
+        wide_dim = dims_without_column[0]
+        item_columns = {
+            c: item
+            for c in other_columns
+            if not is_unnamed(c) and (item := as_item(c, wide_dim)) is not NOT_AN_ITEM
+        }
+        if item_columns:
+            reason = (
+                f"Wide format over '{wide_dim.name}' assumed, as there is no column "
+                f"'{VALUE_COLUMN}' and '{wide_dim.name}' is the only dimension without column."
+            )
+            return _wide_layout(
+                df,
+                dim_columns=dim_columns,
+                wide_dim=wide_dim,
+                item_columns=item_columns,
+                other_columns=other_columns,
+                reason=reason,
+                allow_extra_values=allow_extra_values,
+                allow_missing_values=allow_missing_values,
+            )
+    raise FlodymDataError(_layout_problem(df, dims_without_column, other_columns, ""))
+
+
+def _long_layout(
+    dim_columns: dict[str, Hashable], other_columns: list[Hashable], reason: str
+) -> DataLayout:
+    """Layout with one value column: ``value``, or else the only further column with a name."""
+    if VALUE_COLUMN in other_columns:
+        value_column = VALUE_COLUMN
+    else:
+        named = [c for c in other_columns if not is_unnamed(c)]
+        candidates = named if named else other_columns
+        if not candidates:
+            raise FlodymDataError(
+                f"{reason} But there is no value column: all columns are dimension columns."
+            )
+        if len(candidates) > 1:
+            raise FlodymDataError(
+                f"{reason} But there are several further columns, so the value column is "
+                f"unclear: {list_values(other_columns)}. Name the value column "
+                f"'{VALUE_COLUMN}'; then further columns are ignored."
+            )
+        value_column = candidates[0]
+    ignored = [c for c in other_columns if c != value_column]
+    return DataLayout(
+        dim_columns=dim_columns, reason=reason, value_column=value_column, ignored_columns=ignored
+    )
+
+
+def _wide_layout(
+    df: pd.DataFrame,
+    dim_columns: dict[str, Hashable],
+    wide_dim: Dimension,
+    item_columns: dict[Hashable, Any],
+    other_columns: list[Hashable],
+    reason: str,
+    allow_extra_values: bool,
+    allow_missing_values: bool,
+) -> DataLayout:
+    """Layout with value columns named by the items of a dimension.
+
+    Raises:
+        FlodymDataError: If further columns contain numbers and extra values are not allowed, or
+            if items have no column and missing values are not allowed.
+    """
+    ignored = [c for c in other_columns if c not in item_columns]
+    problems = []
+    numeric = [c for c in ignored if not is_unnamed(c) and _contains_numbers(df[c])]
+    if numeric and not allow_extra_values:
+        problems.append(
+            f"- Further columns contain numbers, but their names are not items of "
+            f"'{wide_dim.name}': {list_values(numeric)}. Remove them, or set "
+            "allow_extra_values=True to ignore them. Further columns are only ignored if they "
+            "contain no numbers, e.g. units or comments."
+        )
+        problems += [f"  {hint}" for c in numeric if (hint := _duplicate_hint(c, wide_dim))]
+    found_items = set(item_columns.values())
+    missing_items = [item for item in wide_dim.items if item not in found_items]
+    if missing_items and not allow_missing_values:
+        problems.append(
+            f"- Items of '{wide_dim.name}' without column: {list_values(missing_items)}. Add "
+            "these columns, or set allow_missing_values=True to set their values to zero."
+        )
+    if problems:
+        raise FlodymDataError("\n".join([reason, *problems]))
+    return DataLayout(
+        dim_columns=dim_columns,
+        reason=reason,
+        wide_dim=wide_dim,
+        item_columns=item_columns,
+        ignored_columns=ignored,
+    )
+
+
+def to_long_format(df: pd.DataFrame, layout: DataLayout) -> pd.DataFrame:
+    """Columns named by dimension name, and the value column ``value``, in long format.
+
+    The index labels are kept, as error messages use them to name rows.
+    """
+    renamed = {column: dim_name for dim_name, column in layout.dim_columns.items()}
+    if layout.wide_dim is None:
+        renamed[layout.value_column] = VALUE_COLUMN
+        return df[list(renamed)].rename(columns=renamed)
+    id_columns = list(layout.dim_columns.values())
+    long_df = df[id_columns + list(layout.item_columns)].rename(columns=renamed)
+    long_df = long_df.melt(
+        id_vars=list(layout.dim_columns),
+        value_vars=list(layout.item_columns),
+        var_name=layout.wide_dim.name,
+        value_name=VALUE_COLUMN,
+        ignore_index=False,
+    )
+    long_df[layout.wide_dim.name] = long_df[layout.wide_dim.name].map(layout.item_columns)
+    return long_df
+
+
+def _layout_problem(
+    df: pd.DataFrame,
+    dims_without_column: list[Dimension],
+    other_columns: list[Hashable],
+    reason: str,
+) -> str:
+    """Explain that dimensions have no column, with exact hints on the probable cause."""
+    dims_text = ", ".join(f"'{dim.name}' ({dim.letter})" for dim in dims_without_column)
+    lines = [reason] if reason else []
+    lines += [
+        f"No column for dimension(s) {dims_text}. Columns: {list_values(df.columns)}.",
+        "Dimension columns must be named by dimension name or letter.",
+    ]
+    hints = _column_hints(df, dims_without_column, other_columns)
+    if len(dims_without_column) > 1 or not reason:
+        for dim in dims_without_column:
+            item_columns = [c for c in other_columns if as_item(c, dim) is not NOT_AN_ITEM]
+            if item_columns:
+                hints.append(
+                    f"The names of columns {list_values(item_columns)} are items of "
+                    f"'{dim.name}'. Wide format over '{dim.name}' needs a column for every "
+                    "other dimension."
+                )
+    hints += _header_hints(df, dims_without_column)
+    lines += [f"- {hint}" for hint in hints]
+    return "\n".join(lines)
+
+
+def _column_hints(
+    df: pd.DataFrame, dims_without_column: list[Dimension], other_columns: list[Hashable]
+) -> list[str]:
+    """Hints for columns which probably belong to a dimension without column."""
+    hints = []
+    labels = {name: dim for dim in dims_without_column for name in (dim.name, dim.letter)}
+    for column in other_columns:
+        holds_items_of = [dim for dim in dims_without_column if _holds_items(df[column], dim)]
+        if holds_items_of:
+            dim = holds_items_of[0]
+            if is_unnamed(column):
+                hints.append(
+                    f"Column {column!r} has no header, but holds items of '{dim.name}'. Name it "
+                    f"'{dim.name}' or '{dim.letter}'."
+                )
+            elif as_item(column, dim) is not NOT_AN_ITEM:
+                hints.append(
+                    f"The first row seems to be data, not a header: column {column!r} is named by "
+                    f"an item of '{dim.name}' and holds items of '{dim.name}'. The first row "
+                    "must name the columns."
+                )
+            else:
+                hints.append(
+                    f"Column {column!r} holds items of '{dim.name}'. Name it '{dim.name}' or "
+                    f"'{dim.letter}'."
+                )
+            continue
+        meant = closest_name(column, labels)
+        if meant is not None:
+            hints.append(
+                f"Column {column!r} is not named like a dimension. Did you mean '{meant}'?"
+            )
+    return hints
+
+
+def _header_hints(df: pd.DataFrame, dims_without_column: list[Dimension]) -> list[str]:
+    """Hints for data whose header is missing or not in the first row."""
+    hints = []
+    if list(df.columns) == list(range(len(df.columns))):
+        hints.append(
+            "The column names are 0, 1, 2, ...: the data have no header row, e.g. as read with "
+            "header=None. The first row must name the columns."
+        )
+    elif sum(is_unnamed(c) for c in df.columns) >= len(df.columns) / 2:
+        hints.append(
+            "Most columns have no header. If the header is not in the first row, e.g. below a "
+            "title, pass header=... or skiprows=... to pandas.read_csv or read_excel (also "
+            "accepted as keyword arguments by the flodym readers)."
+        )
+    if not isinstance(df.index, pd.RangeIndex):
+        for dim in dims_without_column:
+            if _holds_items(df.index.to_series(), dim):
+                hints.append(
+                    f"The index holds items of '{dim.name}', but has no name. Name it "
+                    f"'{dim.name}' or '{dim.letter}', or call reset_index() and name the column."
+                )
+    return hints
+
+
+def _duplicate_hint(column: Hashable, dim: Dimension) -> str:
+    """Hint at a column which pandas renamed because its header occurs twice."""
+    match = RENAMED_DUPLICATE.match(str(column))
+    if match is None or as_item(match.group(1), dim) is NOT_AN_ITEM:
+        return ""
+    return (
+        f"Column {column!r}: the header {match.group(1)!r} seems to occur twice; pandas renamed "
+        f"the second column to {column!r}."
+    )
+
+
+def _holds_items(entries: pd.Series, dim: Dimension) -> bool:
+    """Whether all entries that are not empty are items of the dimension, and there are some."""
+    unique = [entry for entry in entries.unique() if not _is_missing(entry)]
+    return bool(unique) and all(as_item(entry, dim) is not NOT_AN_ITEM for entry in unique)
+
+
+def _contains_numbers(entries: pd.Series) -> bool:
+    """Whether any entry is a number or a string that can be read as a number."""
+    return bool(pd.to_numeric(entries.dropna(), errors="coerce").notna().any())
+
+
+def as_item(value: Any, dim: Dimension) -> Any:
+    """The item of ``dim`` that ``value`` stands for, or ``NOT_AN_ITEM``.
+
+    ``value`` is converted to the dtype of the dimension, if given. Otherwise, it is compared as
+    text, as pandas reads all column names of CSV files as text, e.g. ``'2020'``.
+    """
+    if dim.dtype is not None:
         try:
-            return value if value in dim.items else NOT_AN_ITEM
-        except TypeError:  # unhashable or incomparable value
+            value = dim.dtype(value)
+        except (ValueError, TypeError):
             return NOT_AN_ITEM
+        return value if value in set(dim.items) else NOT_AN_ITEM
+    items_by_text = {str(item): item for item in dim.items}
+    return items_by_text.get(str(value), NOT_AN_ITEM)
+
+
+def is_unnamed(column: Hashable) -> bool:
+    """Whether pandas named the column because its header cell is empty."""
+    return isinstance(column, str) and UNNAMED_COLUMN.match(column) is not None
 
 
 def _type_hint(items: list[Any], dim: Dimension) -> str:

@@ -327,23 +327,22 @@ class FlodymArray(FlodymBaseModel):
         Args:
             dims: Dimensions of the FlodymArray
             df: pandas DataFrame containing the values of the FlodymArray.
-                Dimensions of the named dim array can be given in DataFrame columns or the index.
-                The DataFrame can be in long or wide format, that is there can either be one value
-                column, or the value columns are named by items of one FlodymArray dimension.
-                If dimension names or letters are not given in the respective index or column, they
-                are inferred from the items of the dimensions of the FlodymArray.
-                It is advisable to give the dimension names in the DataFrame, as this makes the
-                error messages more informative if there are typos in the items or if items are
-                missing.
-                Ordering of rows and columns is arbitrary, but the items across each dimension must
-                be given.
-                Dimensions with only one item do not need to be given in the DataFrame.
-                Supersets of dimensions (i.e. additional values) will lead to an error.
-                Further columns, e.g. units or comments, are ignored if this is unambiguous:
-                in long format, if the value column is named ``value`` and all dimension columns
-                are named by dimension name or letter; in wide format, if they are right of the
-                value columns and contain no numbers. Rows and unnamed columns without any entry
-                are ignored.
+                Dimension columns must be named by dimension name or letter. They can also be
+                index levels with these names. Dimensions with only one item need no column.
+                The layout follows from the column names:
+
+                - Long format, if there is a column ``value``, or every dimension has a
+                  column: the values are in column ``value``, or else in the only further
+                  column. Other columns, e.g. units or comments, are ignored.
+                - Wide format, if exactly one dimension has no column, and column names are
+                  items of it: these columns hold the values. Further columns are ignored if
+                  they contain no numbers.
+
+                Ordering of rows and columns is arbitrary. Items that are not in a dimension
+                lead to an error, unless ``allow_extra_values`` is set. Rows and unnamed
+                columns without any entry are ignored. For arrays with a single value, a
+                DataFrame without rows and with a number as only column name is accepted: this
+                is how pandas reads a file with a single field.
             allow_missing_values: Whether to allow missing values in the DataFrame.
                 This includes both missing rows, and NaN values in the value column.
                 Defaults to False.
@@ -1401,23 +1400,22 @@ class FlodymArray(FlodymBaseModel):
 
         Args:
             df_in: pandas DataFrame containing the values of the FlodymArray.
-                Dimensions of the named dim array can be given in DataFrame columns or the index.
-                The DataFrame can be in long or wide format, that is there can either be one value
-                column, or the value columns are named by items of one FlodymArray dimension.
-                If dimension names or letters are not given in the respective index or column, they
-                are inferred from the items of the dimensions of the FlodymArray.
-                It is advisable to give the dimension names in the DataFrame, as this makes the
-                error messages more informative if there are typos in the items or if items are
-                missing.
-                Ordering of rows and columns is arbitrary, but the items across each dimension must
-                be given.
-                Dimensions with only one item do not need to be given in the DataFrame.
-                Supersets of dimensions (i.e. additional values) will lead to an error.
-                Further columns, e.g. units or comments, are ignored if this is unambiguous:
-                in long format, if the value column is named ``value`` and all dimension columns
-                are named by dimension name or letter; in wide format, if they are right of the
-                value columns and contain no numbers. Rows and unnamed columns without any entry
-                are ignored.
+                Dimension columns must be named by dimension name or letter. They can also be
+                index levels with these names. Dimensions with only one item need no column.
+                The layout follows from the column names:
+
+                - Long format, if there is a column ``value``, or every dimension has a
+                  column: the values are in column ``value``, or else in the only further
+                  column. Other columns, e.g. units or comments, are ignored.
+                - Wide format, if exactly one dimension has no column, and column names are
+                  items of it: these columns hold the values. Further columns are ignored if
+                  they contain no numbers.
+
+                Ordering of rows and columns is arbitrary. Items that are not in a dimension
+                lead to an error, unless ``allow_extra_values`` is set. Rows and unnamed
+                columns without any entry are ignored. For arrays with a single value, a
+                DataFrame without rows and with a number as only column name is accepted: this
+                is how pandas reads a file with a single field.
             allow_missing_values: Whether to allow missing values in the DataFrame.
                 This includes both missing rows, and NaN values in the value column.
                 Defaults to False.

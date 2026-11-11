@@ -40,6 +40,10 @@ print("Values:", my_array.values.flatten())
 # %% [markdown]
 # Notice how the entries were re-ordered according to the order of items in the dims.
 # the `from_df()` methods performs lots of checks and can handle different input data formats.
+# Dimension columns must be named by dimension name or letter, as `Time` and `Material` above.
+# The values are in long format, as above, in a column `value`. In wide format, the items of one
+# dimension name the value columns, e.g. one column per year. Further columns, e.g. units or
+# comments, are ignored.
 #
 # For details on allowed formats, see the API reference of the method.
 #

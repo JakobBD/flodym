@@ -20,7 +20,7 @@ from flodym import (
     Process,
     StockArray,
 )
-from flodym._df_to_flodym_array import DataFrameToFlodymDataConverter
+from flodym._df_to_flodym_array import NOT_AN_ITEM, as_item
 
 PLACES = Dimension(name="place", letter="p", items=["Earth", "Sun", "Moon", "Venus"])
 TIME = Dimension(name="time", letter="t", items=[1990, 2000, 2010])
@@ -364,7 +364,7 @@ def test_from_df_strips_whitespace_when_enabled():
     df = pd.DataFrame(
         {
             " place ": [" Earth ", " Earth ", " Sun ", " Sun "],
-            " time ": [1990, 2000, 1990, 2000],
+            " h ": [1990, 2000, 1990, 2000],
             " value ": [1.0, 2.0, 3.0, 4.0],
         }
     )
@@ -386,7 +386,7 @@ def test_from_df_does_not_strip_whitespace_when_disabled():
     )
     dims_subset = DimensionSet(dim_list=[selected_places, HISTORIC_TIME])
 
-    with pytest.raises(ValueError, match="Could not determine which column"):
+    with pytest.raises(ValueError, match="No column for dimension"):
         FlodymArray.from_df(dims=dims_subset, df=df, strip_whitespace=False)
 
 
@@ -431,51 +431,41 @@ def test_from_df_strips_whitespace_of_many_distinct_items(column_dtype):
     assert_array_equal(result.values, expected)
 
 
-def test_from_df_identifies_unnamed_dim_columns_by_items():
+def test_from_df_requires_named_dim_columns():
     typed_places = Dimension(name="place", letter="p", items=["Earth", "Sun"], dtype=str)
     typed_time = Dimension(name="time", letter="t", items=list(range(1900, 2000)), dtype=int)
     dims_typed = DimensionSet(dim_list=[typed_places, typed_time])
-    expected = np.random.rand(2, 100)
     df = pd.DataFrame(
         {
             "region": np.repeat(["Earth", "Sun"], 100),
             "year": np.tile(np.arange(1900, 2000), 2),
-            "amount": expected.flatten(),
+            "amount": np.random.rand(200),
         }
     )
 
-    result = FlodymArray.from_df(dims=dims_typed, df=df)
-
-    assert_array_equal(result.values, expected)
-
-
-@pytest.mark.parametrize(
-    "arr, expected",
-    [
-        (["Earth", "Sun", "Moon", "Venus"], True),
-        (["Venus", "Moon", "Sun", "Earth", "Earth"], True),
-        (["Earth", "Sun", "Moon"], False),
-        (["Earth", "Sun", "Moon", "Venus", "Mars"], False),
-        ([], False),
-    ],
-)
-def test_same_items(arr, expected):
-    assert DataFrameToFlodymDataConverter.same_items(arr, PLACES) == expected
+    with pytest.raises(ValueError, match="Column 'region' holds items of 'place'"):
+        FlodymArray.from_df(dims=dims_typed, df=df)
+    named = df.rename(columns={"region": "p", "year": "t"})
+    result = FlodymArray.from_df(dims=dims_typed, df=named)
+    assert_array_equal(result.values, df["amount"].to_numpy().reshape(2, 100))
 
 
 @pytest.mark.parametrize(
-    "arr, expected",
+    "value, dtype, expected",
     [
-        (["1990", "2000", "2010"], True),
-        ([2010.0, 2000.0, 1990.0], True),
-        (["1990", "2000"], False),
-        (["1990", "2000", "2010", "2020"], False),
-        (["1990", "2000", "not a year"], False),
+        ("1990", int, 1990),
+        (2010.0, int, 2010),
+        ("2020", int, NOT_AN_ITEM),
+        ("not a year", int, NOT_AN_ITEM),
+        # without dtype, column names from CSV files ("1990") are compared as text
+        ("1990", None, 1990),
+        (1990, None, 1990),
+        ("1990.0", None, NOT_AN_ITEM),
     ],
 )
-def test_same_items_converts_to_dim_dtype(arr, expected):
-    typed_time = Dimension(name="time", letter="t", items=[1990, 2000, 2010], dtype=int)
-    assert DataFrameToFlodymDataConverter.same_items(arr, typed_time) == expected
+def test_as_item(value, dtype, expected):
+    time = Dimension(name="time", letter="t", items=[1990, 2000, 2010], dtype=dtype)
+    assert as_item(value, time) is expected or as_item(value, time) == expected
 
 
 def test_from_df_scalar_value():
